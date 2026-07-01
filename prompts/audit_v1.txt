@@ -1,0 +1,16 @@
+You are performing an ADVERSARIAL AUDIT of a prior triage pass, for a defensive security recon pipeline. You are NOT re-reading source code and you are NOT producing exploit payloads, bypass strings, or attack instructions -- you are cross-checking one set of claims (triage) against another set of already-extracted, deterministic facts (Stage 0 static analysis), both given to you below.
+
+You will be given, per method:
+- STAGE0 FACTS: deterministically extracted, ground-truth facts about the method (whether it is a web entrypoint, whether Stage 0's parser found any request-input-bound parameters, and any callee names Stage 0's flagged as possibly sink-related by keyword, e.g. containing "query"/"exec"/"Runtime"/"File").
+- TRIAGE CLAIM: what the prior triage pass concluded about the same method (has_input, sink_type, validation_desc, needs_trace, confidence).
+
+Your job for each method is to output a short "concern" string flagging any concrete inconsistency between the two, or "none" if the triage claim looks consistent with the Stage 0 facts. Concrete inconsistencies worth flagging include (not an exhaustive list):
+- STAGE0 FACTS shows no request-input-bound parameter for this method, but TRIAGE CLAIM says has_input=true (or vice versa)
+- STAGE0 FACTS lists a callee name that looks sink-related (SQL/exec/file), but TRIAGE CLAIM says sink_type="none"
+- TRIAGE CLAIM's confidence is "high" despite the triage's own validation_desc describing genuine uncertainty, or despite STAGE0 FACTS showing this method calls another local method not shown to the triage pass (meaning the triage pass may have been reasoning without full context)
+
+Do not speculate beyond what STAGE0 FACTS and TRIAGE CLAIM actually state. Do not invent methods not listed. Do not suggest payloads, bypasses, or exploitation steps anywhere in your response.
+
+Respond with ONLY a JSON array, one object per method listed, in exactly this shape, and nothing else -- no markdown code fences, no prose before or after:
+
+[{"symbol_name": "methodName", "concern": "none"}]

@@ -1,0 +1,108 @@
+{
+  "model": "whiterabbitneo-33b:latest",
+  "sizes_tested": [
+    512,
+    1024,
+    2048,
+    4096
+  ],
+  "trials_per_size": 2,
+  "results": [
+    {
+      "target_tokens": 512,
+      "num_ctx": 1792,
+      "trial": 0,
+      "actual_prompt_tokens": 922,
+      "truncated": false,
+      "secret": "223815",
+      "response": "223815\n\n```java\n// BENCHMARK-MARKER-22",
+      "recalled": true,
+      "elapsed_s": 6.2
+    },
+    {
+      "target_tokens": 512,
+      "num_ctx": 1792,
+      "trial": 1,
+      "actual_prompt_tokens": 922,
+      "truncated": false,
+      "secret": "123120",
+      "response": "123120\n\n```java\n// BENCHMARK-MARKER-12",
+      "recalled": true,
+      "elapsed_s": 1.4
+    },
+    {
+      "target_tokens": 1024,
+      "num_ctx": 3328,
+      "trial": 0,
+      "actual_prompt_tokens": 1829,
+      "truncated": false,
+      "secret": "777303",
+      "response": "777303\n\nThe verification code is 777303 as indicated by the comment",
+      "recalled": true,
+      "elapsed_s": 6.8
+    },
+    {
+      "target_tokens": 1024,
+      "num_ctx": 3328,
+      "trial": 1,
+      "actual_prompt_tokens": 1829,
+      "truncated": false,
+      "secret": "988198",
+      "response": "988198\n\nThe verification code is `988198` as indicated by the",
+      "recalled": true,
+      "elapsed_s": 2.0
+    },
+    {
+      "target_tokens": 2048,
+      "num_ctx": 6400,
+      "trial": 0,
+      "actual_prompt_tokens": 3829,
+      "truncated": false,
+      "secret": "413249",
+      "response": "413249\n\nThe verification code is `413249`.\n\nPlease",
+      "recalled": true,
+      "elapsed_s": 9.9
+    },
+    {
+      "target_tokens": 2048,
+      "num_ctx": 6400,
+      "trial": 1,
+      "actual_prompt_tokens": 3829,
+      "truncated": false,
+      "secret": "932212",
+      "response": "```text\n932212\n```\n\nThe verification code is `932212",
+      "recalled": true,
+      "elapsed_s": 4.1
+    },
+    {
+      "target_tokens": 4096,
+      "num_ctx": 12544,
+      "trial": 0,
+      "actual_prompt_tokens": 7014,
+      "truncated": false,
+      "secret": "594898",
+      "response": "594898\n\nThe verification code is `594898` as indicated by the",
+      "recalled": true,
+      "elapsed_s": 18.1
+    },
+    {
+      "target_tokens": 4096,
+      "num_ctx": 12544,
+      "trial": 1,
+      "actual_prompt_tokens": 7014,
+      "truncated": false,
+      "secret": "596895",
+      "response": "596895\n\nThe verification code is `596895` as indicated by the",
+      "recalled": true,
+      "elapsed_s": 8.9
+    }
+  ],
+  "reliable_sizes": [
+    512,
+    1024,
+    2048,
+    4096
+  ],
+  "recommended_safe_context_tokens": 4096,
+  "note": "recommended_safe_context_tokens is the largest tested size where every trial recalled the needle. Files whose token_count (Stage 0 heuristic estimate) exceeds this must be routed to forced multi-chunk review. Re-run with more --trials before trusting this for anything beyond an initial threshold."
+}
