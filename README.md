@@ -54,6 +54,21 @@ this looks like in practice.
   that case, not a bug, just the cost of running a 33B model on constrained
   hardware.
 
+### Why Ollama, not `llama-server` directly
+
+This was a deliberate evaluation, not a default. Ollama's engine is itself a
+llama.cpp/ggml fork, so there's no output-quality difference between running
+through Ollama or running `llama-server` directly -- the choice is about
+operational overhead. Ollama wins here because it owns model lifecycle
+(load/unload, GPU/CPU offload, keep-alive) instead of the pipeline needing to
+supervise a long-running server process, and its tag registry (`ollama
+list`/`ollama create`) is what this project's model-provenance recording is
+built on. One thing switching runtimes would *not* fix: a model continuing to
+emit prose after a structurally complete JSON value is a general property of
+grammar-constrained decoding, not an Ollama-specific bug -- the pipeline
+already parses defensively for this (see `CLAUDE.md`'s "Local Model Runtime"
+section) regardless of which engine is underneath.
+
 ## Setup
 
 ```bash

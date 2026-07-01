@@ -108,6 +108,23 @@ Prompt requirements (do not weaken these when editing):
   Ollama's local API (default `http://localhost:11434`) — not llama.cpp directly,
   not an OpenAI-compatible wrapper, not any hosted endpoint. If a library or code
   pattern assumes a different runtime, stop and flag it rather than silently adapting.
+- **Why Ollama over calling llama.cpp/`llama-server` directly** (evaluated, not
+  just assumed): Ollama's own inference engine is a llama.cpp/ggml fork, so there
+  is no correctness or output-quality difference between the two at the model
+  level — this is a choice about operational surface area, not capability.
+  Ollama wins on that basis for this project: it owns model lifecycle (load/unload,
+  GPU/CPU offload heuristics, keep-alive) so the pipeline doesn't need to supervise
+  a long-running `llama-server` process itself, and its tag registry (`ollama list`,
+  `ollama create` from a Modelfile) is what `llm_runs.model_name` provenance and the
+  "confirm the exact tag" rule below are built on. Concretely: don't expect a
+  runtime switch to fix output-formatting reliability problems (e.g. a model
+  continuing to emit prose after a structurally complete JSON value) — that's a
+  general property of grammar-constrained decoding, present in both engines since
+  they share the same grammar mechanism, not an Ollama-specific defect. Parse
+  defensively (see `json.JSONDecoder().raw_decode` usage in
+  `pipeline/stage1_triage/triage.py` / `pipeline/stage2_audit/audit.py`) regardless
+  of runtime, rather than assuming a runtime change would make whole-string
+  `json.loads` safe.
 - Use the official `ollama` Python library for calls where practical
   (`ollama.chat(...)` / `ollama.generate(...)`), falling back to direct HTTP calls
   against the Ollama REST API only where the library doesn't expose needed options
