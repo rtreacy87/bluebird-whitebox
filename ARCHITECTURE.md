@@ -46,22 +46,44 @@ is a *pipeline* of scripted stages rather than an agent loop.
                                          │        input_sources, triage_results
                                          │ writes: audit_results, llm_runs
                                          ▼
+                    ┌────────────────────────────────────────────--┐
+                    │  Stage 3 -- Trace Queue (deterministic,       │
+                    │             graph walk, no LLM)               │
+                    │  pipeline/stage3_trace/builder.py             │
+                    └───────────────────┬────────────────────────--┘
+                                         │ reads: triage_results, call_edges,
+                                         │        input_sources, symbols
+                                         │ writes: trace_queue
+                                         ▼
+                    ┌────────────────────────────────────────────--┐
+                    │  Stage 4 -- Deep-Trace (LLM, per queue item)  │
+                    │  pipeline/stage4_deep_trace/deep_trace.py     │
+                    │  prompts/trace_v1.txt                         │
+                    └───────────────────┬────────────────────────--┘
+                                         │ reads: trace_queue, symbols, files
+                                         │ writes: trace_results, llm_runs,
+                                         │         trace_queue.status
+                                         ▼
               ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
                 NOT YET BUILT (see CLAUDE.md build order -- deliberately
-                gated behind validated Stage 0-2, not a missing feature)
+                gated behind validated Stage 0-4, not a missing feature)
 
-                Stage 3 -- Trace Worklist   (deterministic queue)
-                Stage 4 -- Deep-Trace Pass  (LLM, per queue item)
                 Stage 5 -- Human Verification Gate
                 Stage 6 -- Findings Store / report export
               ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
 ```
 
 Everything left of that dashed line is implemented and validated against the
-BlueBird corpus. Everything right of it is spec'd in `CLAUDE.md` but
-intentionally not started -- also note **cross-file call resolution** isn't
-built either; Stage 0 only resolves calls within a single file (see
-"Known boundaries" below).
+BlueBird corpus (Stage 3/4's validation run: `enqueue-trace` produced 17
+`trace_queue` rows from the corpus's 17 `sink_type='sql_unsafe'` triage rows,
+and a full `trace` pass correctly traced all three regression vulnerabilities
+-- `/find-user`, `/forgot`, `/profile/{id}` -- as `exploitable_path`; see
+"Known boundaries" below for what that run also revealed about Stage 4's
+reliability). Everything right of the dashed line is spec'd in `CLAUDE.md`
+but intentionally not started -- also note **cross-file call resolution**
+isn't built either; Stage 0 only resolves calls within a single file, and
+Stage 3's graph walk is intra-file-only for the same reason (see "Known
+boundaries" below).
 
 ## Directory map
 
@@ -74,8 +96,8 @@ pipeline/
                           constants that must trace back to bench/
                           context_benchmark.py, never a guess.
   cli.py                  argparse entrypoint: index / triage / audit /
-                          coverage subcommands. Thin -- just wires args to
-                          the stage modules below.
+                          enqueue-trace / trace / coverage subcommands. Thin
+                          -- just wires args to the stage modules below.
 
   stage0_index/
     parser.py             Pure function: java source text in, ParsedFile
@@ -115,11 +137,35 @@ pipeline/
                           facts (never raw source) to adversarially compare
                           against Stage 1's claims.
 
+  stage3_trace/builder.py   Orchestrates Stage 3: no LLM call at all. Reads
+                          every `triage_results` row with
+                          `sink_type='sql_unsafe'` (deliberately not gated
+                          on `needs_trace` -- see "Known boundaries" below)
+                          and, per row, deterministically walks (a) any
+                          `call_edges` already resolved intra-file and (b) a
+                          same-file getter-name-matching heuristic (e.g. a
+                          call to `user.getEmail()` in one method is matched
+                          against another same-file method's
+                          `input_sources.param_name = 'email'`) to assemble
+                          `trace_queue.assembled_context_symbol_ids` -- the
+                          bounded context Stage 4 is allowed to see.
+
+  stage4_deep_trace/deep_trace.py   Orchestrates Stage 4: for each `pending`
+                          `trace_queue` row, slices the source of every
+                          symbol in `assembled_context_symbol_ids` (never
+                          anything outside that set), calls `LLMRunner` with
+                          `prompts/trace_v1.txt`, defensively parses the
+                          JSON verdict, filters `evidence_symbol_ids` down to
+                          only IDs actually shown to the model (never
+                          trusted unfiltered), and updates
+                          `trace_queue.status` to `done` or `blocked`.
+
 prompts/
-  triage_v1.txt, audit_v1.txt   Versioned system prompts. CLAUDE.md's rule:
-                          edit by incrementing the version suffix, never
-                          overwrite in place -- llm_runs.prompt_version must
-                          always resolve to an exact historical prompt.
+  triage_v1.txt, audit_v1.txt, trace_v1.txt   Versioned system prompts.
+                          CLAUDE.md's rule: edit by incrementing the version
+                          suffix, never overwrite in place --
+                          llm_runs.prompt_version must always resolve to an
+                          exact historical prompt.
 
 bench/context_benchmark.py    Standalone script, not part of the pipeline
                           proper. Needle-in-haystack test that empirically
@@ -140,6 +186,13 @@ tests/
                           run doesn't trigger it. This is the automated
                           form of CLAUDE.md's "must be run against BlueBird
                           before Stage 0-2 changes are done" rule.
+  test_stage3_4_bluebird.py       Two tiers in one file: a fast deterministic
+                          tier (no Ollama -- real Stage 0 parse output plus
+                          hand-inserted `triage_results` rows, asserting the
+                          builder's graph walk finds the right same-file
+                          links) and a RUN_LLM_TESTS=1 tier (full Stage 0-4
+                          run, ~30+ min, asserting the three known
+                          vulnerabilities trace as `exploitable_path`).
 ```
 
 ## The database is the integration contract
@@ -163,18 +216,22 @@ files ──┬─▶ symbols ──┬─▶ call_edges         (Stage 0, all d
         triage_results ────────────────┘
              │        (symbol_id nullable on purpose --
              │         see "Hallucination detection" below)
-             ▼
-        audit_results
-             (audited_run_id points back at the triage llm_runs row
-              being checked; run_id points at the audit's own llm_runs row --
-              two different provenance links on one row, on purpose)
+             ├──────────────────────────▶ audit_results
+             │       (audited_run_id points back at the triage llm_runs row
+             │        being checked; run_id points at the audit's own
+             │        llm_runs row -- two provenance links on one row)
+             │
+             ▼ (Stage 3: WHERE sink_type='sql_unsafe', deterministic)
+        trace_queue ──▶ trace_results
+             (assembled_context_symbol_ids is Stage 3's graph walk output;
+              Stage 4 may only cite evidence_symbol_ids from within it)
 ```
 
 ## What happens on one `triage` call, step by step
 
-Tracing `pipeline.cli triage` end to end, because this is the shape every
-future LLM-driven stage (Stage 4's deep-trace, if/when it's built) will
-follow too:
+Tracing `pipeline.cli triage` end to end, because this is the shape Stage
+4's `trace` call follows too (see "Stage 3 then Stage 4, step by step"
+below for where that shape diverges):
 
 1. `cli.py` builds an `OllamaClient`, calls `verify_model_available()`
    (queries `ollama list` equivalent -- fails loudly if the `--model` tag
@@ -208,6 +265,39 @@ follow too:
 Stage 0 facts (input-source presence, keyword-flagged callee names) plus
 Stage 1's claims -- see `pipeline/stage2_audit/audit.py`'s module docstring
 for why that separation matters.
+
+## Stage 3 then Stage 4, step by step
+
+`enqueue-trace` (Stage 3) has no `--model`/`--host` -- it's pure Python and
+never touches Ollama:
+
+1. `enqueue_trace_targets()` selects every `triage_results` row with
+   `sink_type='sql_unsafe'` not already enqueued (idempotent re-run). If a
+   row's `symbol_id` is NULL (a hallucinated triage row -- nothing to walk),
+   it's enqueued directly as `status='blocked'` with an empty context.
+2. For every other row, `assemble_context()` starts with the target
+   method's own `symbol_id`, adds any `call_edges` already `resolved=1`
+   (real intra-file method-to-method calls), then scans the target's own
+   `call_edges.callee_raw_name` for a getter pattern (`user.getEmail` ->
+   property `email`) and looks for *other* same-file methods whose
+   `input_sources.param_name` matches that property AND whose own
+   `sink_type='sql_unsafe'` -- a same-file, deterministic stand-in for
+   "where might this value have been written."
+3. The result (a JSON array of symbol_ids, plus the matched property name as
+   `target_variable` if the heuristic fired) is written to one
+   `trace_queue` row, `status='pending'`.
+
+`trace` (Stage 4) then behaves like `triage`/`audit`: for each `pending`
+`trace_queue` row, it fetches only the symbols listed in
+`assembled_context_symbol_ids` (all guaranteed same-file, by construction of
+step 2 above), slices their source by `line_start`/`line_end`, and sends
+Ollama the Stage 1 origin claim + those method bodies via
+`prompts/trace_v1.txt`. The response's `evidence_symbol_ids` are filtered
+down to whatever subset of the shown symbols the model actually cited --
+never trusted unfiltered, same defensive posture as everywhere else in this
+pipeline. `trace_queue.status` becomes `done`, or `blocked` if the verdict
+is `insufficient_context` (meaning the model itself reported it would need
+something outside what Stage 3 could assemble intra-file).
 
 ## Key design decisions (and why)
 
@@ -269,17 +359,45 @@ every method.
   this is deliberately not started until Stage 0-2 are validated against a
   second corpus (Pass2) and a measured gap in `resolved=0` edges justifies
   it -- not a default next step.
-- **No multi-step data-flow tracing yet.** Stage 1 can tell you a specific
-  method contains an unsafe sink, but it reasons about that one method in
-  isolation. A vulnerability where attacker-controlled data is stored in one
-  method and read back unsafely in a completely different method (a
-  "second-order" pattern -- see `EXPECTED_FINDINGS.md`'s `/profile/{id}`
-  writeup for BlueBird's real example of this) is exactly what Stage 3/4 are
-  designed to eventually automate; today a human has to trace that chain by
-  hand. `triage_results.needs_trace` is Stage 1's own best-effort flag for
-  "this might be one of those," but it's a hint, not a guarantee -- see
-  `WALKTHROUGH.md`'s interpretation section for a real example of that flag
-  being set incorrectly.
+- **`needs_trace` is not used to gate Stage 3's queue -- it's empirically
+  unreliable.** `ProfileController.profile` is one of the three regression
+  vulnerabilities (`/profile/{id}`, second-order SQLi) and triage correctly
+  flagged it `sink_type='sql_unsafe'`, but set `needs_trace=0` even though
+  the unsafe value (`user.getEmail()`) is a textbook case of that flag's own
+  definition (came from a queried object, not the method's own parameter).
+  Because of this, Stage 3 enqueues every `sink_type='sql_unsafe'` row
+  regardless of `needs_trace` -- treating the flag as informational only,
+  never as a filter that could silently drop a real regression case.
+- **Second-order tracing works, but only intra-file.** Stage 3's
+  getter-name-matching heuristic correctly links `ProfileController.profile`
+  (reads `user.getEmail()`) to `ProfileController.editProfilePOST` (writes
+  raw `email`) because both live in the same file. It would **not** find
+  `AuthController.signupPOST` -- the *other* real write site for `email` --
+  because that's a different file, and per `CLAUDE.md`'s build order,
+  cross-file resolution is a deliberately deferred, separate decision. This
+  is a known, accepted gap, not a bug: Stage 3 does not attempt to bridge it
+  by guessing.
+- **One verdict per queued item, not per concatenated variable.** A method
+  can concatenate several variables into one unsafe query where only some
+  are actually exploitable (see `tests/searching_for_strings_pipeline_writeup.md`:
+  `AuthController.signupPOST` concatenates `name`/`username`/`email`
+  (exploitable) and `passwordHash` (not, since it's BCrypt output) into one
+  INSERT). `trace_results.verdict` is still one structured value per
+  `trace_queue` row -- that per-variable nuance can only live in the
+  free-text `path_narrative`, the same granularity limit Stage 1's
+  `validation_desc` already has. Fixing this would need a schema change and
+  wasn't done in this pass.
+- **Stage 4's verdict isn't guaranteed to correct Stage 1's mistakes,
+  even when shown the exact code that contradicts them.** A real run against
+  BlueBird found `AuthController.resetPOST` and `PostController.createPost`
+  -- both triage false positives (their actual DML calls are parameterized)
+  -- still came back `exploitable_path` from Stage 4: its `path_narrative`
+  restated the method's control flow without ever noting the
+  `new Object[]{...}` / `?` placeholder parameterization visible in the
+  exact source it was shown. This is a real WhiteRabbitNeo reliability
+  limitation surfaced by actually running Stage 4, not a bug in the
+  orchestration code -- one more reason Stage 5's human verification gate
+  isn't optional.
 - **`triage`/`audit` re-process every file on every run.** There's no
   "only re-process files whose Stage 0 fingerprint changed since the last
   triage run" logic yet, unlike `index`, which is fully incremental. On a
@@ -293,14 +411,17 @@ every method.
 old prompt file in place (don't overwrite `triage_v1.txt`) so old
 `llm_runs` rows stay resolvable to the exact prompt that produced them.
 
-**Adding Stage 3 (trace worklist)**: per `CLAUDE.md`, this stage's queueing
-logic must be deterministic Python (a graph walk over `call_edges` /
-`field_access`), not an LLM decision. It reads `triage_results` rows where
-`needs_trace = 1` and writes `trace_queue` rows (schema already defined in
-`schema.sql`); no existing table's write-side needs to change. Model it
-after `stage1_triage`/`stage2_audit`'s existing shape: a pure
-orchestration module, one `LLMRunner` call per queue item for Stage 4,
-`llm_runs` provenance on every call, defensive JSON parsing.
+**Adding Stage 5 (human verification gate)**: this is the next unbuilt
+stage. Per `CLAUDE.md` it's a human-led review step, not an LLM or
+automation stage -- its job is to let a person mark `findings.verified_by_human`
+and `status` after inspecting a `trace_results` row (or a `triage_results`
+row directly, for findings without a trace) against the live target, e.g.
+via `tests/live-debugging.md`'s manual IDE-debugging technique, which is
+exactly what `findings.verification_method='live_debug'` already exists to
+record. Nothing about live debugging (or query-log inspection, or manual
+payload testing) belongs in pipeline code -- Stage 5 only needs a way to
+read candidate findings and write a human's verdict back, never to drive a
+debugger or fire requests itself.
 
 **Swapping the model**: no code changes needed -- `--model <tag>` on any CLI
 command. Re-run `bench/context_benchmark.py` against the new model first

@@ -1,14 +1,15 @@
 """CLI entrypoint for the white-box recon pipeline.
 
 Usage:
-    python -m pipeline.cli index   --source <dir> --db data/recon.db
-    python -m pipeline.cli triage  --source <dir> --db data/recon.db [--model NAME]
-    python -m pipeline.cli audit   --db data/recon.db [--model NAME]
-    python -m pipeline.cli coverage --db data/recon.db
+    python -m pipeline.cli index         --source <dir> --db data/recon.db
+    python -m pipeline.cli triage        --source <dir> --db data/recon.db [--model NAME]
+    python -m pipeline.cli audit         --db data/recon.db [--model NAME]
+    python -m pipeline.cli enqueue-trace --db data/recon.db
+    python -m pipeline.cli trace         --source <dir> --db data/recon.db [--model NAME]
+    python -m pipeline.cli coverage      --db data/recon.db
 
-Only Stage 0-2 are wired up here per CLAUDE.md's build order -- Stage 3+
-(trace worklist / deep-trace / human verification / findings export) is
-deliberately not implemented yet.
+Stage 5+ (human verification / findings export) is deliberately not
+implemented yet per CLAUDE.md's build order.
 """
 
 import argparse
@@ -19,6 +20,8 @@ from pipeline.llm.ollama_client import LLMRunner, ModelNotAvailableError, Ollama
 from pipeline.stage0_index.indexer import index_source_tree
 from pipeline.stage1_triage.triage import triage_all_files
 from pipeline.stage2_audit.audit import audit_all_files
+from pipeline.stage3_trace.builder import enqueue_trace_targets
+from pipeline.stage4_deep_trace.deep_trace import trace_all_pending
 
 DEFAULT_MODEL = "whiterabbitneo-33b:latest"
 
@@ -52,6 +55,25 @@ def cmd_audit(args):
         sys.exit(1)
     runner = LLMRunner(conn, client)
     stats = audit_all_files(conn, runner)
+    print(stats)
+
+
+def cmd_enqueue_trace(args):
+    conn = db.connect(args.db)
+    stats = enqueue_trace_targets(conn)
+    print(stats)
+
+
+def cmd_trace(args):
+    conn = db.connect(args.db)
+    client = OllamaClient(model_name=args.model, num_ctx=args.num_ctx, host=args.host)
+    try:
+        client.verify_model_available()
+    except ModelNotAvailableError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    runner = LLMRunner(conn, client)
+    stats = trace_all_pending(conn, runner, args.source)
     print(stats)
 
 
@@ -103,6 +125,21 @@ def build_parser():
     p_audit.add_argument("--host", default="http://localhost:11434")
     p_audit.add_argument("--num-ctx", dest="num_ctx", type=int, default=config.DEFAULT_NUM_CTX)
     p_audit.set_defaults(func=cmd_audit)
+
+    p_enqueue_trace = sub.add_parser(
+        "enqueue-trace",
+        help="Stage 3: deterministic trace-queue builder (call-graph + same-file name-matching graph walk)",
+    )
+    p_enqueue_trace.add_argument("--db", default="data/recon.db")
+    p_enqueue_trace.set_defaults(func=cmd_enqueue_trace)
+
+    p_trace = sub.add_parser("trace", help="Stage 4: LLM deep-trace pass over pending trace_queue items")
+    p_trace.add_argument("--source", required=True, help="same source root used for `index`")
+    p_trace.add_argument("--db", default="data/recon.db")
+    p_trace.add_argument("--model", default=DEFAULT_MODEL)
+    p_trace.add_argument("--host", default="http://localhost:11434")
+    p_trace.add_argument("--num-ctx", dest="num_ctx", type=int, default=config.DEFAULT_NUM_CTX)
+    p_trace.set_defaults(func=cmd_trace)
 
     p_coverage = sub.add_parser("coverage", help="print Stage 0 -> Stage 1 coverage as a query, not a stored field")
     p_coverage.add_argument("--db", default="data/recon.db")

@@ -157,10 +157,13 @@ thing the audit pass exists to catch, and it only works because
 - `Cookie` — a cookie value.
 - `SessionAttribute` — a value pulled from the HTTP session.
 
-## Stage 1-4 — LLM-derived analysis (never ground truth)
+## Stage 1-2 — LLM-derived analysis (never ground truth)
 
 Every row here must be traceable to an `llm_runs` row for provenance (model,
-prompt version, chunking).
+prompt version, chunking). (`trace_results`, Stage 4's LLM output, is also
+`llm_runs`-backed the same way — see the "Stage 3-4" section below, grouped
+there with `trace_queue` since the two tables are Stage 3/4's paired
+input/output.)
 
 ### `llm_runs`
 
@@ -282,13 +285,15 @@ columns specifically so this two-run relationship is queryable.
 - `hallucinated_row` — the triage run produced a row referencing a symbol that doesn't exist.
 - `ambiguous` — the audit couldn't cleanly classify the symbol's coverage.
 
-## Stage 3 — Deterministic trace queue (sub-agent substitute)
+## Stage 3-4 — Trace queue (deterministic) and deep-trace (LLM)
 
 ### `trace_queue`
 
-One row per candidate to deep-trace, generated deterministically from
-`triage_results` where `needs_trace = 1`. Represents scripted work
-assignment — not an LLM decision.
+One row per candidate to deep-trace. Populated by
+`pipeline/stage3_trace/builder.py`'s `enqueue_trace_targets()`, which
+selects every `triage_results` row with `sink_type = 'sql_unsafe'` — not
+gated on `needs_trace` (see below). Represents scripted work assignment —
+not an LLM decision.
 
 **Why:** WhiteRabbitNeo is deliberately never given an open-ended "explore
 this codebase" instruction — it's "not a highly agentic model" (per
@@ -299,6 +304,37 @@ context a deterministic graph walk decided the model needs, handed to it as
 a fixed task rather than letting it wander the call graph itself. `status`
 lets the queue be processed incrementally and resumably (pending → in
 progress → done/blocked) without the LLM tracking its own state.
+
+**Why `sink_type = 'sql_unsafe'`, not `needs_trace = 1`, is the enqueue
+predicate:** `needs_trace` turned out to be empirically unreliable as a
+queueing gate. Against the real BlueBird corpus, `ProfileController.profile`
+— one of the three required regression vulnerabilities (`/profile/{id}`,
+second-order SQLi) — was correctly flagged `sink_type='sql_unsafe'` by
+triage, but triage set `needs_trace=0` on it anyway, despite the unsafe
+value (`user.getEmail()`, read from a previously-queried object) being
+exactly the case `needs_trace`'s own definition describes. Gating Stage 3's
+queue on `needs_trace` would have silently dropped a known regression case,
+so the builder enqueues every `sql_unsafe` row unconditionally and treats
+`needs_trace` as informational only.
+
+**How `assembled_context_symbol_ids` and `target_variable` actually get
+populated:** the graph walk (`assemble_context()`) starts with the target
+method's own `symbol_id`, adds any `call_edges` already `resolved=1` (real
+intra-file method-to-method calls — rare in this corpus, 4 of 224 edges,
+but real), and then scans the target's own `call_edges.callee_raw_name` for
+a getter-style pattern (e.g. `user.getEmail` → property `email`), searching
+*other same-file* methods whose `input_sources.param_name` matches that
+property **and** whose own `sink_type = 'sql_unsafe'` — a deterministic,
+same-file stand-in for "where might this value have been written." This is
+what links `profile` (reads `user.getEmail()`) to `editProfilePOST` (writes
+raw `email`) with zero LLM involvement, and is why `target_variable` gets
+set to the matched property name (`"email"`) only when this heuristic
+fires — it stays `NULL` for direct-parameter cases where the flagged value
+came straight from the method's own request parameters (e.g.
+`AuthController.signupPOST`). Because this walk is intra-file only (per
+`CLAUDE.md`'s build order), it will **not** find `AuthController.signupPOST`
+as a second write site for `profile`'s `email` — that's a different file,
+and a known, accepted gap rather than something the heuristic guesses at.
 
 | Column | Type | Description |
 |---|---|---|
@@ -332,6 +368,21 @@ that produces this row is restricted to reasoning only over
 `assembled_context_symbol_ids` from `trace_queue` — it's instructed not to
 speculate about files it hasn't been shown, since anything it wasn't shown
 also isn't in `evidence_symbol_ids` and couldn't be verified anyway.
+`pipeline/stage4_deep_trace/deep_trace.py` also defensively filters
+`evidence_symbol_ids` down to the subset actually shown to the model before
+writing the row — the instruction alone is never trusted unenforced.
+
+**A real reliability finding, not a hypothetical:** a full run against
+BlueBird found `AuthController.resetPOST` and `PostController.createPost` —
+both known Stage 1 false positives (their real DML calls are parameterized)
+— still verdicted `exploitable_path` at Stage 4, even with the exact
+parameterized call visible in the context they were shown; the
+`path_narrative` restated the method's control flow without ever noting the
+`new Object[]{...}` / `?` placeholder parameterization. This is why the
+checkability this table is designed around (citations, not just a verdict)
+matters in practice, and why this table's output is never treated as a
+final finding on its own — `findings` (below) requires human verification
+regardless of what `trace_results.verdict` says.
 
 | Column | Type | Description |
 |---|---|---|

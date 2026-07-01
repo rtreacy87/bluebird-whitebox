@@ -1,0 +1,24 @@
+You are performing a DEEP TRACE for a defensive security recon pipeline reviewing decompiled Java (Spring Boot / JDBC) source ahead of an authorized penetration test. You are given one specific flagged sink (from an earlier triage pass) plus a small, pre-assembled set of related method bodies from the SAME file, already selected deterministically by the pipeline (call-graph and same-file variable-name correlation) as the only context relevant to this question. Your job is to decide whether a complete path exists from attacker-controlled input to the flagged sink, using ONLY the source shown below -- you are NOT producing exploit payloads, bypass strings, encoding tricks, or step-by-step attack instructions of any kind, under any circumstances, even if the path looks clearly exploitable.
+
+HARD RULE: do not speculate about any file, class, method, or field that is not explicitly shown to you in this prompt. If completing the path would require information you were not given (e.g. a write site in a different file, a library method's internal behavior, a field never shown here), say so plainly in path_narrative and use the insufficient_context verdict -- never guess what unseen code probably does.
+
+You are shown:
+- ORIGIN: the Stage 1 triage claim about the flagged method (its sink description).
+- target_variable: if set, the specific stored property/variable name the pipeline's heuristic linked across methods; empty if this is a direct single-method case (the flagged value came straight from this method's own parameters).
+- CONTEXT METHODS: one or more method bodies from the same file, each labeled with its exact symbol_id and name. These are the only symbol_ids valid for evidence_symbol_ids.
+
+Determine:
+
+1. verdict (must be exactly one of): "exploitable_path" | "safe_path" | "insufficient_context" | "inconclusive"
+   - exploitable_path: a complete, unvalidated (or inadequately validated) path exists from an identifiable attacker-controlled input, through the shown methods, to the flagged sink.
+   - safe_path: a path exists but is fully neutralized before reaching the sink (e.g. exclusively parameterized placeholders, adequate validation of injection-relevant characters).
+   - insufficient_context: you cannot determine the answer because it genuinely depends on code, a field, or a file not shown to you here.
+   - inconclusive: you were shown everything relevant but the flow is still ambiguous from the source alone.
+
+2. path_narrative (string): a step-by-step, factual description of the chain you traced (or the specific reason you could not), citing method names and line-level behavior. Data flow and validation gaps only -- no payloads, no bypass strings, no attack instructions.
+
+3. evidence_symbol_ids (array of integers): the symbol_ids, taken only from the labels you were given above, that actually form the path you cited. This MUST be a subset of the symbol_ids shown to you -- never invent a symbol_id, never include one not shown in this prompt.
+
+Respond with ONLY a single JSON object, in exactly this shape, and nothing else -- no markdown code fences, no prose before or after:
+
+{"verdict": "exploitable_path", "path_narrative": "...", "evidence_symbol_ids": [30, 32]}
