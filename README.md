@@ -31,18 +31,28 @@ this looks like in practice.
 
 - **Python 3.10+**
 - **Ollama**, running locally (`http://localhost:11434` by default) with a
-  model pulled/imported that's suited to code review. This project was
-  built and validated against `whiterabbitneo-33b`. Any model you use should
-  be capable enough at instruction-following to reliably return structured
-  JSON -- smaller/weaker models will still run but produce lower-quality,
-  less-reliable triage (see "Model choice" below).
+  model imported that's suited to code review. This project was built and
+  validated against WhiteRabbitNeo-33B-v1.5 (see "Getting a model" below --
+  it isn't in Ollama's own library, so it needs a manual import). Any model
+  you use should be capable enough at instruction-following to reliably
+  return structured JSON -- smaller/weaker models will still run but produce
+  lower-quality, less-reliable triage (during development, a smaller 8B model
+  correctly parsed the plumbing but conflated a hash computation with the
+  actual SQL sink in its reasoning, which the 33B model did not).
 - Decompiled Java source to point the pipeline at. Fernflower (bundled with
   most modern decompiler toolchains) or CFR both produce source the parser
   handles well. Extract a Spring Boot fat jar (`BOOT-INF/classes/...`) and
   point `--source` at the package root you want indexed.
 - No internet access is required or used by the pipeline itself -- every LLM
   call stays local. You do need internet once, during setup, to `pip
-  install` dependencies and `ollama pull` a model.
+  install` dependencies and download a model.
+- **~20-30GB free disk** for a 33B-class quantized model (a Q5_K_M GGUF of
+  WhiteRabbitNeo-33B-v1.5 is ~23GB), plus enough GPU/system RAM to run it at
+  a usable speed. If the model doesn't fully fit in VRAM, Ollama falls back
+  to partial CPU offload, which is dramatically slower (single-digit tokens/sec
+  in testing) -- expect multi-minute triage/audit calls on large files in
+  that case, not a bug, just the cost of running a 33B model on constrained
+  hardware.
 
 ## Setup
 
@@ -56,15 +66,46 @@ python3 -m venv .venv
 ollama list
 ```
 
-If you don't already have a suitable model:
+### Getting a model: WhiteRabbitNeo is not in the Ollama library
+
+`ollama pull whiterabbitneo-33b` will fail -- WhiteRabbitNeo isn't published
+to Ollama's own model library. [WhiteRabbitNeo-33B-v1.5](https://huggingface.co/WhiteRabbitNeo/WhiteRabbitNeo-33B-v1.5)
+is distributed on Hugging Face as safetensors, under a modified DeepSeek
+Coder license (review its usage restrictions -- e.g. no military use -- before
+adopting it for an engagement). To run it in Ollama you need a GGUF-format
+quantization, then import it locally:
 
 ```bash
-ollama pull whiterabbitneo-33b     # or your model of choice
+# 1. Download a GGUF quantization from Hugging Face. The base repo is
+#    safetensors-only; community quantizations exist as separate repos, e.g.:
+#      https://huggingface.co/manuelgutierrez/WhiteRabbitNeo-33B-v1.5-GGUF
+#      https://huggingface.co/dranger003/WhiteRabbitNeo-33B-v1.5-iMat.GGUF
+#    Verify availability yourself -- community repos move/disappear -- and
+#    pick a quant level (e.g. Q5_K_M) that fits your available VRAM/RAM.
+pip install -U huggingface_hub   # provides the `hf` CLI (huggingface-cli is deprecated/removed)
+hf download manuelgutierrez/WhiteRabbitNeo-33B-v1.5-GGUF \
+    whiterabbitneo-33b-v1.5.Q5_K_M.gguf --local-dir ./models
+
+# 2. Write a Modelfile pointing at the downloaded weights
+cat > Modelfile <<'EOF'
+FROM ./models/whiterabbitneo-33b-v1.5.Q5_K_M.gguf
+EOF
+
+# 3. Import it into Ollama under a local tag of your choosing
+ollama create whiterabbitneo-33b:latest -f Modelfile
 ```
 
-Whatever tag `ollama list` shows is what you pass to `--model` below --
-custom Modelfile imports can leave a tag that doesn't match the model's
-marketed name, and the pipeline records this exact string in `llm_runs` for
+Alternatively, if a GGUF repo supports it, `ollama pull
+hf.co/<user>/<repo>:<quant-tag>` pulls and imports directly from Hugging
+Face in one step, without a manual Modelfile -- but it tags the model as
+`hf.co/<user>/<repo>:<quant-tag>` rather than a short name, so you'll likely
+want `ollama cp` afterward to give it a shorter local tag.
+
+Either way, run `ollama list` afterward and use **whatever tag actually
+shows up** as `--model` below -- a custom import like this routinely leaves a
+tag that doesn't match the model's marketed name (`whiterabbitneo-33b:latest`
+above is just what this repo happened to name it locally, not a fixed
+requirement), and the pipeline records this exact string in `llm_runs` for
 reproducibility, so getting it right matters.
 
 ### Benchmark the model's effective context window (recommended once per model)
