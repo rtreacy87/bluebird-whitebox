@@ -104,27 +104,160 @@ code --list-extensions
 You should see `vscjava.vscode-java-pack` (and the individual extensions it
 bundles, like `redhat.java` and `vscjava.vscode-java-debug`) in the list.
 
-## Step 3 — Install PostgreSQL (BlueBird needs a real database to run)
+## Step 3 — Set up PostgreSQL (BlueBird needs a real database to run)
 
-BlueBird's config (`~/BlueBirdSourceCode/BOOT-INF/classes/application.properties`)
-expects a PostgreSQL database named `bluebird`, reachable at
-`localhost:5432`, with user `bbuser` / password `bbpassword`:
+BlueBird won't start at all without a database listening on `localhost:5432`
+with a specific user, password, and database name. Those exact values are
+already sitting in a config file that shipped with the decompiled source —
+you're not choosing them, you're reading them:
 
+```bash
+cat ~/BlueBirdSourceCode/BOOT-INF/classes/application.properties
+```
 ```
 spring.datasource.url= jdbc:postgresql://localhost:5432/bluebird
 spring.datasource.username= bbuser
 spring.datasource.password= bbpassword
+
+bluebird.app.jwtSecret= 72Ao88agtuOFT7PerfCtF80qzuyK1sEa
+bluebird.app.jwtExpirationMs= 8640000
+bluebird.app.jwtCookieName= auth
 ```
 
-Install and start PostgreSQL, then create that user, database, and the
-`users` table BlueBird's own SQL queries expect (inferred directly from the
-`SELECT`/`INSERT` statements across `AuthController.java`,
+**That output is the file's existing content, shown so you know what to
+create below — it's not something you type into your terminal.** (If you
+tried running a line like `spring.datasource.url= jdbc:postgresql://...`
+directly as a shell command, that's what just happened — those are Java
+properties-file syntax, not shell syntax, and your shell correctly told you
+it doesn't know what `spring.datasource.url=` means as a command.)
+
+What you actually need to do is get *some* PostgreSQL server running with a
+`bbuser`/`bbpassword` login and a `bluebird` database on port 5432. There
+are two ways to do that:
+
+- **Option A — container (recommended).** Runs PostgreSQL fully isolated
+  from the rest of your Kali install, needs no `sudo` if you use Podman
+  (rootless by design), and a single command deletes it completely when
+  you're done — nothing left behind, nothing to remember to undo. This is
+  what was actually used to produce every real value in this writeup (see
+  "What was actually run for this writeup" at the end).
+- **Option B — install PostgreSQL directly on Kali.** More persistent
+  (survives a reboot without you re-running anything), but it's a real
+  system service you're installing and starting, and undoing it fully later
+  takes more than one command.
+
+Pick one — you only need a working `localhost:5432` by the end of this step,
+not both.
+
+### Option A — container (recommended)
+
+Kali ships both Podman and Docker. **Podman is rootless** — it runs
+entirely as your own user, no `sudo` and no background daemon required —
+which is why it's used here. If you'd rather use Docker instead, the same
+commands work with `docker` in place of `podman`, just prefix each one with
+`sudo` (Kali's Docker runs as a root-owned daemon by default, unless you've
+already added your user to the `docker` group).
+
+Start the database:
+
+```bash
+podman run -d --name bluebird-pg \
+  -e POSTGRES_USER=bbuser \
+  -e POSTGRES_PASSWORD=bbpassword \
+  -e POSTGRES_DB=bluebird \
+  -p 5432:5432 \
+  docker.io/library/postgres:15
+```
+
+What this does, flag by flag: `-d` runs it in the background; `--name
+bluebird-pg` gives it a name you can refer to later instead of a random ID;
+the three `-e` flags set exactly the username/password/database name
+`application.properties` expects; `-p 5432:5432` makes the container's
+Postgres reachable at `localhost:5432` on your actual machine, not just
+inside the container. The first run will print a long series of `Copying
+blob sha256:...` lines — that's Podman downloading the Postgres image, a
+one-time cost.
+
+Confirm it's actually ready to accept connections (it takes a couple of
+seconds to initialize after starting):
+
+```bash
+podman exec bluebird-pg pg_isready -U bbuser -d bluebird
+```
+```
+/var/run/postgresql:5432 - accepting connections
+```
+
+Now create the one table BlueBird's queries expect (inferred directly from
+the `SELECT`/`INSERT` statements across `AuthController.java`,
 `ProfileController.java`, and `IndexController.java`):
+
+```bash
+podman exec bluebird-pg psql -U bbuser -d bluebird -c "
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    username TEXT UNIQUE,
+    email TEXT,
+    password TEXT,
+    description TEXT
+);"
+```
+
+Confirm it exists:
+
+```bash
+podman exec bluebird-pg psql -U bbuser -d bluebird -c "\d users"
+```
+You should see a column listing (`id`, `name`, `username`, `email`,
+`password`, `description`).
+
+**When you're completely done with this writeup** (after Step 8), tear the
+whole thing down in one step — this deletes the container and every row in
+it, which is the point:
+
+```bash
+podman stop bluebird-pg
+podman rm bluebird-pg
+```
+
+### Option B — install PostgreSQL directly on Kali
 
 ```bash
 sudo apt install -y postgresql
 sudo systemctl start postgresql
+```
 
+**A gotcha worth checking for before you go further:** Kali's PostgreSQL
+packaging allows more than one PostgreSQL *version* to be installed side by
+side, each running its own independent "cluster" on its own port — this is
+normal Debian/Kali packaging behavior, not something you did wrong, but it
+means `sudo systemctl start postgresql` doesn't guarantee anything ends up
+listening on port 5432 specifically. Check what you actually have:
+
+```bash
+pg_lsclusters
+```
+```
+Ver Cluster Port Status Owner    Data directory              Log file
+17  main    5433 down   postgres /var/lib/postgresql/17/main /var/log/postgresql/postgresql-17-main.log
+18  main    5432 down   postgres /var/lib/postgresql/18/main /var/log/postgresql/postgresql-18-main.log
+```
+(Your version numbers/ports may differ — the point is to find which row
+owns port `5432`, since that's the one `application.properties` needs.)
+Every cluster still shows `down` even after `systemctl start postgresql` if
+that command only started one of several installed versions. Start the
+specific cluster that owns port 5432 — using the real version number from
+*your* `pg_lsclusters` output, not necessarily `18`:
+
+```bash
+sudo pg_ctlcluster 18 main start
+```
+
+Once something is confirmed running on port 5432, create the user,
+database, and table:
+
+```bash
 sudo -u postgres psql -c "CREATE USER bbuser WITH PASSWORD 'bbpassword';"
 sudo -u postgres psql -c "CREATE DATABASE bluebird OWNER bbuser;"
 sudo -u postgres psql -d bluebird -c "
@@ -147,14 +280,29 @@ sudo -u postgres psql -d bluebird -c "\d users"
 You should see a column listing (`id`, `name`, `username`, `email`,
 `password`, `description`).
 
-**Note on this guide's own test setup:** for actually producing the values
-shown below, a disposable, rootless container (`podman run ... postgres:15`)
-was used instead of the system PostgreSQL service, purely so the database
-could be thrown away afterward without touching anything else on the
-machine. Either approach works identically from BlueBird's point of view —
-it only cares that something is listening on `localhost:5432` with the
-right user/database/table. Use whichever you're more comfortable with; the
-system-service instructions above are simpler for a first attempt.
+**To fully undo this later**, unlike Option A's one-command teardown:
+```bash
+sudo -u postgres psql -c "DROP DATABASE bluebird;"
+sudo -u postgres psql -c "DROP USER bbuser;"
+```
+This leaves PostgreSQL itself installed and running — remove it entirely
+with `sudo apt remove --purge postgresql*` if you want your system back to
+exactly how it was before this step.
+
+### Either way: confirm something is actually listening on 5432
+
+Before moving on to Step 4, this should show a `LISTEN` line no matter
+which option you picked:
+
+```bash
+ss -tlnp 2>/dev/null | grep 5432
+```
+```
+LISTEN 0      128         0.0.0.0:5432       0.0.0.0:*
+```
+If you don't see this, BlueBird will fail to start in Step 5 with a
+database connection error — go back and check whichever option you chose
+actually finished starting before continuing.
 
 ## Step 4 — Recompile the decompiled source so it can actually run
 
@@ -385,12 +533,11 @@ Every value shown above (the `passwordHash` string, the exact
 `BadSqlGrammarException`/`PSQLException` messages, the "Unterminated string
 literal started at position 177" text) is real output from an actual run,
 not a reconstruction. For this writeup specifically:
-- PostgreSQL ran in a disposable rootless Podman container
-  (`podman run ... -e POSTGRES_USER=bbuser -e POSTGRES_PASSWORD=bbpassword
-  -e POSTGRES_DB=bluebird -p 5432:5432 postgres:15`) rather than the system
-  service, purely so it could be thrown away afterward — functionally
-  identical to Step 3's system-service instructions from BlueBird's
-  perspective.
+- PostgreSQL ran via Step 3's Option A exactly as written (a disposable
+  rootless Podman container) rather than Option B's system service, purely
+  so it could be thrown away afterward — functionally identical to
+  BlueBird either way, since it only cares that something is listening on
+  `localhost:5432` with the right credentials.
 - Rather than the VS Code GUI (not available in a headless terminal),
   `jdb` — the JDK's own command-line debugger — was attached to the same
   JDWP port (8000) and driven with the same underlying protocol VS Code's
