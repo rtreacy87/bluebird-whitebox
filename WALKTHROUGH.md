@@ -386,6 +386,104 @@ for the underlying technique). `ARCHITECTURE.md`'s "Known boundaries"
 section is the terse, reference-style version of everything in this
 subsection.
 
+### Verifying a finding with VS Code's debugger, and logging it
+
+Everything so far is a *hypothesis* -- a plain-English claim about what the
+code looks like it does, produced by a model reading (or being shown) text.
+The step that turns "the tool flagged this" into "I've confirmed this" is
+watching the real, running application do the thing the tool described.
+This walkthrough uses VS Code's Java debugger for that, because it's the
+technique `tests/live-debugging.md` documents in full (installing VS Code
+and its Java extension pack on Kali, getting BlueBird into a runnable state
+from decompiled source, attaching to it over JDWP) --
+`tests/searching_for_strings_live_debug_writeup.md` is a complete worked
+example of the steps below against this exact BlueBird corpus, if you want
+every command spelled out.
+
+Picking up from where "What Stage 3/4 concluded" left off -- say you want
+to verify `signupPOST`'s finding specifically:
+
+**1. Find the exact evidence row to link your verification to.** You want
+`trace_results.trace_id` (or, if the method was never queued for a trace,
+`triage_results.result_id`) so the finding you log points back at the exact
+upstream row that produced it, not just a free-floating note:
+
+```bash
+sqlite3 -header -column data/recon.db "
+SELECT tres.trace_id, tr1.symbol_name_raw, tres.verdict
+FROM trace_results tres
+JOIN trace_queue tq ON tq.queue_id = tres.queue_id
+JOIN triage_results tr1 ON tr1.result_id = tq.origin_triage_result_id
+WHERE tr1.symbol_name_raw = 'signupPOST';
+"
+```
+```
+trace_id  symbol_name_raw  verdict
+--------  ---------------  ----------------
+4         signupPOST       exploitable_path
+```
+
+**2. In VS Code, set a breakpoint on the line the tool flagged**, attach the
+debugger (`F5`, per `tests/live-debugging.md`'s `launch.json` setup), and
+trigger the request. For `signupPOST`, that's line 171 -- the INSERT
+concatenation. Submit a signup form and watch the **Variables** panel when
+execution pauses. What you're checking here is whatever the tool's
+hypothesis actually claimed -- in this case, whether `name`/`username`/
+`email` show up unmodified while `passwordHash` looks nothing like the
+`password` you typed.
+
+**3. Log what you saw, right away** -- while it's in front of you, not
+reconstructed from memory afterward:
+
+```bash
+.venv/bin/python -m pipeline.cli log-finding \
+    --db data/recon.db \
+    --endpoint /signup \
+    --vuln-class sql_injection \
+    --verification-method live_debug \
+    --status confirmed \
+    --severity medium \
+    --notes "Confirmed live via VS Code debugger: name/username/email pass through signupPOST's INSERT unescaped; passwordHash is BCrypt output and cannot be exploited." \
+    --source-trace-id 4
+```
+```
+logged finding_id=1
+```
+
+A few things worth knowing about this command before you use it:
+
+- `--verification-method` must be exactly one of `live_debug`, `query_log`,
+  `manual_payload` -- it's a real database constraint (`schema.sql`'s
+  `CHECK`), not just a suggestion, and a typo fails immediately with a
+  clear error rather than silently writing something wrong.
+- `--status` defaults to `needs_review`; use `confirmed` once you've
+  actually seen the behavior, `rejected` if the debugger showed the finding
+  doesn't hold up (e.g. a value you expected to be raw turned out to be
+  validated after all).
+- `verified_by_human` is set to `1` automatically the moment you run this
+  command -- that's the whole point of it. You'd only ever pass
+  `--not-verified` in the rare case of jotting a note down without
+  actually asserting you'd verified anything.
+- A `--source-trace-id` that doesn't exist in `trace_results` (a typo, or a
+  method that was never traced) fails loudly before writing anything, same
+  as an invalid `--verification-method`/`--status`.
+
+**4. Check what you've logged, any time:**
+
+```bash
+sqlite3 -header -column data/recon.db "
+SELECT finding_id, endpoint, vuln_class, verification_method, status, reviewed_at
+FROM findings ORDER BY reviewed_at DESC;
+"
+```
+
+This `findings` table is the only place `verified_by_human = 1 AND status =
+'confirmed'` actually means something -- per `CLAUDE.md`, that combination
+is meant to be the sole filter a future report generator (Stage 6, not yet
+built) applies. Everything upstream (`triage_results`, `audit_results`,
+`trace_results`) stays a lead, however confident the model sounded, until
+it's gone through this step.
+
 ## Teardown / archiving after an engagement
 
 Once you're done with a pass -- whether that's the end of a real engagement

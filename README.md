@@ -15,17 +15,21 @@ See `CLAUDE.md` for the full design spec and build-order rationale, and
 
 ## Current scope
 
-Implemented: **Stage 0 (static index) → Stage 1 (triage) → Stage 2 (audit)**.
+Implemented: **Stage 0 (static index) → Stage 1 (triage) → Stage 2 (audit)
+→ Stage 3 (deterministic trace queue) → Stage 4 (LLM deep-trace)**, plus
+Stage 5's write-side (`log-finding` -- a human records a finding they've
+already manually verified).
 
-Not yet built (deliberately, per the project's build order): Stage 3 (trace
-worklist), Stage 4 (deep-trace), Stage 5 (human verification gate), Stage 6
-(findings export), and cross-file call resolution. Today the pipeline tells
-you *which methods look like unsafe sinks and why*, per file. It does not yet
-trace multi-file/second-order data flow (e.g. "attacker-controlled value
-gets stored, then later read back into an unsafe query elsewhere") -- a
-human reviewer needs to do that tracing manually for now. See the worked
-second-order example in `EXPECTED_FINDINGS.md` (`/profile/{id}`) for what
-this looks like in practice.
+Not yet built: Stage 6 (findings report export), and cross-file call
+resolution (Stage 3's graph walk is intra-file-only, same boundary as
+Stage 0 -- see `ARCHITECTURE.md`'s "Known boundaries"). Stage 3/4 trace
+multi-step, same-file data flow (e.g. "attacker-controlled value gets
+stored by one method, then read back into an unsafe query by another") --
+see the worked `/profile/{id}` example in `EXPECTED_FINDINGS.md`, which
+Stage 3/4 traces correctly today. Cross-*file* chains still require a human
+to trace manually. Stage 4's verdicts are advisory, same as Stage 1/2 --
+see `ARCHITECTURE.md`'s "Known boundaries" for a real example of Stage 4
+not catching a false positive it was shown evidence against.
 
 ## Requirements
 
@@ -163,15 +167,40 @@ initialized from `schema.sql` automatically on first use.
     --db data/recon.db \
     --model whiterabbitneo-33b:latest
 
+# Stage 3: deterministic trace-queue builder -- no LLM, safe to re-run
+# (enqueues every sink_type='sql_unsafe' triage row not already queued)
+.venv/bin/python -m pipeline.cli enqueue-trace --db data/recon.db
+
+# Stage 4: LLM deep-trace over whatever Stage 3 queued
+.venv/bin/python -m pipeline.cli trace \
+    --source ~/BlueBirdSourceCode/BOOT-INF/classes/com/bmdyy/bluebird \
+    --db data/recon.db \
+    --model whiterabbitneo-33b:latest
+
 # Sanity check: did every method actually get triaged?
 .venv/bin/python -m pipeline.cli coverage --db data/recon.db
 ```
 
 Run `index` again any time the source changes -- it's incremental and
-idempotent. `triage`/`audit` currently re-process every file each run (there's
-no "only re-triage changed files" logic yet); on a large codebase, expect
-this to take a while -- triage/audit calls are LLM-bound, and larger,
-CPU/GPU-shared models can take single-digit minutes per file.
+idempotent. `triage`/`audit`/`trace` currently re-process every file/item
+each run (there's no "only re-process changed things" logic yet for those
+three); `enqueue-trace` *is* incremental (it skips any triage row already
+enqueued). On a large codebase, expect the LLM-bound stages to take a
+while -- larger, CPU/GPU-shared models can take single-digit minutes per
+call.
+
+Once you've picked a finding worth manually verifying (e.g. via a live
+debugger -- see "Verifying and logging a finding" below), record the
+result:
+
+```bash
+.venv/bin/python -m pipeline.cli log-finding \
+    --db data/recon.db \
+    --verification-method live_debug \
+    --status confirmed \
+    --notes "..." \
+    --source-trace-id <id>
+```
 
 ### A note on speed
 
@@ -202,9 +231,29 @@ ORDER BY tr.confidence DESC;
 finding -- it means the triage pass looked at a query and concluded it's
 properly parameterized. `needs_trace = 1` means the triage pass believes the
 value reaching a sink didn't come directly from that method's own
-parameters (a field, a stored value, another call's return) -- these are
-exactly the ones a human should chase manually right now, since Stage 3/4
-(automated tracing) isn't built yet.
+parameters (a field, a stored value, another call's return) -- but don't
+rely on this flag to know what Stage 3 will actually enqueue: it's
+demonstrated-unreliable (BlueBird's `profile()` needs tracing but was
+flagged `needs_trace=0` anyway), so Stage 3 enqueues every
+`sink_type='sql_unsafe'` row regardless of this flag. See
+`ARCHITECTURE.md`'s "Stage 3 then Stage 4, step by step" for what actually
+drives the trace queue.
+
+**What did Stage 3/4 conclude for those?**
+```sql
+SELECT tr1.symbol_name_raw AS method, tq.target_variable, tres.verdict, tres.path_narrative
+FROM trace_results tres
+JOIN trace_queue tq ON tq.queue_id = tres.queue_id
+JOIN triage_results tr1 ON tr1.result_id = tq.origin_triage_result_id
+ORDER BY tres.trace_id;
+```
+`verdict` is one of `exploitable_path`, `safe_path`, `insufficient_context`,
+`inconclusive` -- one verdict per queued item, not per individual variable
+inside a multi-variable concatenation (see
+`tests/searching_for_strings_stage3_4_writeup.md` for a concrete case where
+that granularity limit matters). `insufficient_context` specifically means
+Stage 4 itself reported it would need something outside what Stage 3 could
+assemble intra-file -- not a parsing failure.
 
 **Did every method get reviewed?**
 ```bash
@@ -254,6 +303,72 @@ model tag, prompt version, chunk position, and the real token count Ollama
 reported for that call -- useful when a finding looks off and you want to
 know exactly what the model was shown.
 
+## Verifying and logging a finding
+
+Nothing this pipeline produces (`triage_results`, `audit_results`,
+`trace_results`) should reach a report unverified. `log-finding` is how you
+record that verification into the same database, once you've done it --
+it's Stage 5's write-side: a human records a verdict, nothing here decides
+one. This section assumes you're verifying with VS Code's Java debugger
+attached to a locally running copy of the target, per
+`tests/live-debugging.md` (full setup: installing VS Code/the Java
+extension pack, getting a runnable copy of decompiled source, attaching via
+JDWP) and `tests/searching_for_strings_live_debug_writeup.md` (a fully
+worked example against BlueBird). The steps below assume that setup is
+already done and a breakpoint has already told you something concrete.
+
+1. **Find the `trace_id` (or `result_id`) the finding traces back to**, so
+   `log-finding` can link your verification to the exact upstream evidence:
+   ```sql
+   SELECT tres.trace_id, tr1.symbol_name_raw, tres.verdict
+   FROM trace_results tres
+   JOIN trace_queue tq ON tq.queue_id = tres.queue_id
+   JOIN triage_results tr1 ON tr1.result_id = tq.origin_triage_result_id
+   WHERE tr1.symbol_name_raw = 'signupPOST';
+   ```
+   If the method you're verifying was never queued for a trace (Stage 3
+   only enqueues `sink_type='sql_unsafe'` rows), use `--source-triage-result-id`
+   with `triage_results.result_id` instead.
+
+2. **Set your breakpoint and confirm what you're looking for** in VS Code's
+   Variables panel -- e.g. for `AuthController.signupPOST`'s INSERT (line
+   171), confirm `passwordHash` is BCrypt output while `name`/`username`/
+   `email` are untransformed, exactly as in
+   `tests/searching_for_strings_live_debug_writeup.md`.
+
+3. **Log it**, right after you've confirmed it -- while the details are
+   still in front of you, not from memory later:
+   ```bash
+   .venv/bin/python -m pipeline.cli log-finding \
+       --db data/recon.db \
+       --endpoint /signup \
+       --vuln-class sql_injection \
+       --verification-method live_debug \
+       --status confirmed \
+       --severity medium \
+       --notes "Confirmed live via VS Code debugger: name/username/email pass through signupPOST's INSERT unescaped; passwordHash is BCrypt output and cannot be exploited." \
+       --source-trace-id 4
+   ```
+   Prints `logged finding_id=<n>` on success. `--verification-method` must
+   be one of `live_debug`, `query_log`, `manual_payload`; `--status` one of
+   `confirmed`, `rejected`, `needs_review` (default). `verified_by_human` is
+   set to `1` automatically -- this command exists specifically to record
+   that a human did the verifying, so pass `--not-verified` only in the
+   rare case you want to log a note without actually asserting that.
+   A bad `--verification-method`/`--status` or a `--source-trace-id` that
+   doesn't exist fails immediately with a clear error, before writing
+   anything.
+
+4. **Review what you've logged so far:**
+   ```sql
+   SELECT finding_id, endpoint, vuln_class, verification_method, status, reviewed_at
+   FROM findings ORDER BY reviewed_at DESC;
+   ```
+   Nothing outside this table should ever be treated as report-ready --
+   per `CLAUDE.md`, only rows with `verified_by_human = 1 AND status =
+   'confirmed'` are meant to leave the internal DB in an exported report
+   (Stage 6, not yet built, will be what actually automates that filter).
+
 ## When this tool is appropriate
 
 - You're doing **white-box source review** as part of an authorized
@@ -283,9 +398,11 @@ know exactly what the model was shown.
   arbitrary targets.
 - **A substitute for the human verification step.** Nothing here should go
   into a client report without independent confirmation (live debugger,
-  query logs, or manual testing) -- that's Stage 5 in the design (not yet
-  built), and until it exists, treat every row in `triage_results` /
-  `audit_results` as a lead, not a finding.
+  query logs, or manual testing) -- `log-finding` (Stage 5's write-side,
+  see below) exists to *record* that a human did this, not to replace it.
+  Until you've run it against a specific finding, treat every row in
+  `triage_results` / `audit_results` / `trace_results` as a lead, not a
+  finding.
 - **Non-Java codebases, or languages/frameworks the parser doesn't
   understand.** Stage 0 is a javalang-based Java parser; it won't run against
   other languages without a new Stage 0 implementation.

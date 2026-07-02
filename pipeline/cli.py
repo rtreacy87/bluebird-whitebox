@@ -6,10 +6,12 @@ Usage:
     python -m pipeline.cli audit         --db data/recon.db [--model NAME]
     python -m pipeline.cli enqueue-trace --db data/recon.db
     python -m pipeline.cli trace         --source <dir> --db data/recon.db [--model NAME]
+    python -m pipeline.cli log-finding   --db data/recon.db --verification-method live_debug --status confirmed ...
     python -m pipeline.cli coverage      --db data/recon.db
 
-Stage 5+ (human verification / findings export) is deliberately not
-implemented yet per CLAUDE.md's build order.
+Stage 6 (findings report export) is deliberately not implemented yet per
+CLAUDE.md's build order. `log-finding` is Stage 5's write-side only -- a
+human records what they already verified; nothing here decides anything.
 """
 
 import argparse
@@ -22,6 +24,7 @@ from pipeline.stage1_triage.triage import triage_all_files
 from pipeline.stage2_audit.audit import audit_all_files
 from pipeline.stage3_trace.builder import enqueue_trace_targets
 from pipeline.stage4_deep_trace.deep_trace import trace_all_pending
+from pipeline.stage5_verify.logger import InvalidFindingError, log_finding
 
 DEFAULT_MODEL = "whiterabbitneo-33b:latest"
 
@@ -75,6 +78,27 @@ def cmd_trace(args):
     runner = LLMRunner(conn, client)
     stats = trace_all_pending(conn, runner, args.source)
     print(stats)
+
+
+def cmd_log_finding(args):
+    conn = db.connect(args.db)
+    try:
+        finding_id = log_finding(
+            conn,
+            endpoint=args.endpoint,
+            vuln_class=args.vuln_class,
+            verification_method=args.verification_method,
+            status=args.status,
+            verified_by_human=not args.not_verified,
+            severity=args.severity,
+            notes=args.notes,
+            source_trace_id=args.source_trace_id,
+            source_triage_result_id=args.source_triage_result_id,
+        )
+    except InvalidFindingError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"logged finding_id={finding_id}")
 
 
 def cmd_coverage(args):
@@ -140,6 +164,41 @@ def build_parser():
     p_trace.add_argument("--host", default="http://localhost:11434")
     p_trace.add_argument("--num-ctx", dest="num_ctx", type=int, default=config.DEFAULT_NUM_CTX)
     p_trace.set_defaults(func=cmd_trace)
+
+    p_log_finding = sub.add_parser(
+        "log-finding",
+        help="Stage 5 (write-side): record a finding you've already manually verified",
+    )
+    p_log_finding.add_argument("--db", default="data/recon.db")
+    p_log_finding.add_argument("--endpoint", help="e.g. /signup")
+    p_log_finding.add_argument("--vuln-class", dest="vuln_class", help="e.g. blind_sqli, error_based, second_order")
+    p_log_finding.add_argument(
+        "--verification-method",
+        dest="verification_method",
+        choices=["live_debug", "query_log", "manual_payload"],
+        required=True,
+    )
+    p_log_finding.add_argument(
+        "--status", choices=["confirmed", "rejected", "needs_review"], default="needs_review"
+    )
+    p_log_finding.add_argument("--severity", help="free text, e.g. high/medium/low")
+    p_log_finding.add_argument("--notes", help="what you observed and why")
+    p_log_finding.add_argument(
+        "--source-trace-id", dest="source_trace_id", type=int, help="trace_results.trace_id this finding originated from"
+    )
+    p_log_finding.add_argument(
+        "--source-triage-result-id",
+        dest="source_triage_result_id",
+        type=int,
+        help="triage_results.result_id this finding originated from, if no trace exists",
+    )
+    p_log_finding.add_argument(
+        "--not-verified",
+        dest="not_verified",
+        action="store_true",
+        help="record this WITHOUT marking verified_by_human=1 (rare -- this command exists specifically to record verification, so verified_by_human defaults to true)",
+    )
+    p_log_finding.set_defaults(func=cmd_log_finding)
 
     p_coverage = sub.add_parser("coverage", help="print Stage 0 -> Stage 1 coverage as a query, not a stored field")
     p_coverage.add_argument("--db", default="data/recon.db")
