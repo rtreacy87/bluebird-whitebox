@@ -42,8 +42,10 @@ the read-only decompiled artifact.
 - **Sink (the vuln)**: line 40 -- `String sql = "SELECT text, ... FROM posts JOIN users ... WHERE email = '" + user.getEmail() + "'"`, executed via `this.jdbcTemplate.queryForList(sql)` at line 41. The concatenated value is `user.getEmail()`, i.e. data read back out of the `users` table by the safe query above, not the raw path variable.
 - **Sink type**: `sql_unsafe`, but `has_input` for the *sink method itself* is indirect -- the raw request input (`id`) never appears in the unsafe string directly. This is the case `triage_results.needs_trace` / the "indirect flow flag" in the triage checklist exists for: the risk is that `email` is attacker-controlled *stored* data, not request data.
 - **How attacker-controlled data reaches the stored field**: `email` is set via `@PostMapping("/profile/edit")` -> `editProfilePOST` (`ProfileController.java` line 57) or at signup via `@PostMapping("/signup")` -> `signupPOST` (`AuthController.java` line 154). Both of those writes use parameterized `UPDATE`/`INSERT` statements (`ProfileController.java` line 66/84/86, `AuthController.java` line 171-172 -- note `signupPOST`'s INSERT is itself string-concatenated, a second, separate unsafe sink worth flagging independently), so the write path does not filter or escape quote characters -- it just stores whatever string the user submitted, verbatim. That stored value is later read back and concatenated unsafely in `profile()`.
+  `signupPOST`'s INSERT is the subject of its own dedicated writeup series (three angles on the same question -- "which of its four concatenated variables can't be exploited" -- see "Related writeups" at the end of this file).
 - **vuln_class**: `second_order`
-- **Trace expectation for Stage 3+4** (once built): `trace_queue` should enqueue an item rooted at `ProfileController.profile`'s unsafe `queryForList` call with `target_variable = email`/`user`, and the graph walk should surface `editProfilePOST` and `signupPOST` as the fields' write sites even though Stage 0 only resolves intra-file (`field_access` rows for the `email` field in `User.java`'s getter/setter, plus each controller's own `field_access` for `jdbcTemplate`, are what Stage 3 will walk from -- cross-*class* correlation of "who writes `users.email`" is a deterministic SQL-column-name join over `field_access`/`call_edges`, not an LLM inference, and is intra-file-safe since each write site is examined within its own file).
+- **Trace expectation for Stage 3+4** -- Stage 3/4 are now built; this is what actually happened, not a forecast. `pipeline/stage3_trace/builder.py`'s `enqueue_trace_targets()` enqueues every `triage_results` row with `sink_type='sql_unsafe'` (not gated on `needs_trace` -- see below for why), and its same-file getter-name-matching heuristic correctly linked `profile` (reads `user.getEmail()`) to `editProfilePOST` (writes raw `email`) with `target_variable="email"` and `assembled_context_symbol_ids=[profile's symbol_id, editProfilePOST's symbol_id]`, entirely deterministically, no LLM involved in the matching itself. Stage 4 then traced this to `verdict='exploitable_path'`. Full mechanism: `DATA_DICTIONARY.md`'s `trace_queue` entry; full walkthrough: `ARCHITECTURE.md`'s "Stage 3 then Stage 4, step by step".
+- **Why triage's `needs_trace` flag doesn't gate Stage 3's queue**: triage set `needs_trace=0` on `profile` despite this being exactly the "value came from a queried object, not the method's own parameter" case that flag exists to catch (see "What `needs_trace` is telling you" in `WALKTHROUGH.md` for the full narrative). Gating Stage 3 on `needs_trace` would have silently dropped this required regression case, so Stage 3 enqueues on `sink_type='sql_unsafe'` instead and treats `needs_trace` as informational only -- documented as a known boundary in `ARCHITECTURE.md`.
 
 ---
 
@@ -51,3 +53,38 @@ the read-only decompiled artifact.
 
 - `IndexController.index()` (`/`, `q` param, line 34) concatenates `q` unsanitized into a `LIKE` query with **no validation at all** -- also a real, unauthenticated SQL injection. It is not one of the three vulnerabilities CLAUDE.md names as the regression gate, so it is not asserted on by the Stage 1/2 regression test, but the triage pass should still surface it (and if it doesn't, that's a signal about triage prompt quality worth noting, not a gate failure).
 - `ServerInfoController.serverInfo()` (`/server-info`) calls `Runtime.exec` with a hardcoded, non-attacker-controlled command array -- a command-exec sink with no reachable input, not a finding.
+
+## Related writeups
+
+Companion documents that work through specific findings from this file in
+much more depth than fits here, each demonstrating a different way of
+answering the same underlying question -- of `AuthController.signupPOST`'s
+four INSERT-concatenated variables (`name`, `username`, `email`,
+`passwordHash`), which one can't be exploited:
+
+- `tests/searching_for_strings.md` -- the manual, grep-based HTB Academy lab
+  this corpus is drawn from. Ground truth: `passwordHash` (BCrypt output,
+  fixed alphabet, no SQL metacharacters) is the one that can't be exploited.
+- `tests/searching_for_strings_pipeline_writeup.md` -- solves the same
+  question using only this pipeline's Stage 0-2 (static index, triage,
+  audit) -- narrows the corpus to the right method via SQL queries against
+  `data/recon.db` instead of `grep`, then a short human read of the cited
+  lines to finish the answer.
+- `tests/searching_for_strings_stage3_4_writeup.md` -- re-solves it again
+  with Stage 3/4 (built after the above), and finds **no improvement** on
+  this specific question: Stage 3 correctly determines `signupPOST` needs no
+  cross-method context (there's no second-order chain here, unlike
+  `profile`), but Stage 4's verdict is still one structured value per
+  queued item, not per concatenated variable -- the same manual read is
+  still required. Directly informs the "one verdict per queued item" known
+  boundary in `ARCHITECTURE.md`.
+- `tests/searching_for_strings_live_debug_writeup.md` -- confirms the
+  answer empirically instead of by reading, using `tests/live-debugging.md`'s
+  technique: a live breakpoint showing `passwordHash`'s real BCrypt value
+  next to the untransformed `name`/`username`/`email`, then a literal
+  apostrophe in `name` that reaches the query unescaped and crashes the
+  app with a real Postgres syntax error -- proof the pipeline's static
+  hypothesis holds against the running application.
+- `tests/live-debugging.md` -- the general live-debugging methodology
+  (VSCode/Eclipse + JDWP remote attach) the live-debug writeup above
+  applies to this specific case.

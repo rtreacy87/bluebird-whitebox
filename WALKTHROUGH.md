@@ -336,15 +336,55 @@ unsafe query later in that same method uses a *different* value that was
 read back out of the database (a user's stored email address), not the raw
 ID. Triage's plain-English description named the wrong variable as the
 culprit and marked `needs_trace = 0`, when arguably it should have said the
-opposite. Multi-step, "value gets stored now, read back and misused later"
-chains like this are exactly what this pipeline does *not* yet trace
-automatically (that's planned future work, Stage 3/4) -- a human has to
-follow that chain by reading the code. `EXPECTED_FINDINGS.md` has the full
-worked example for this specific case if you want to see the actual lines.
+opposite. `EXPECTED_FINDINGS.md` has the full worked example for this
+specific case if you want to see the actual lines.
 
 **Practical takeaway**: `needs_trace = 1` is a useful hint about where to
 look harder, but `needs_trace = 0` is not a guarantee the finding is simple
 -- read the method yourself either way before ruling out a multi-step chain.
+
+### Following up: Stage 3/4 now trace this automatically (mostly)
+
+Multi-step, "value gets stored now, read back and misused later" chains like
+`profile()`'s are what Stage 3 (deterministic trace queue) and Stage 4 (LLM
+deep-trace) exist for -- and unlike the earlier stages, these are now built,
+not future work. Since `needs_trace` (above) turned out to be an unreliable
+signal, Stage 3 doesn't gate on it: it enqueues every `sql_unsafe` triage
+row and, for `profile` specifically, a same-file heuristic correctly
+discovers `editProfilePOST` as the write site for the `email` value
+`profile` reads back unsafely -- entirely deterministically, no AI
+involved in finding that link. Stage 4 then traced it to a confirmed
+`exploitable_path` verdict.
+
+That's the good news. The honest rest of the story, worth knowing before you
+trust Stage 3/4's output the same way you'd trust Stage 0's:
+
+- **It's still not a substitute for reading the code yourself.** Run
+  `.venv/bin/python -m pipeline.cli enqueue-trace --db data/recon.db` then
+  `.venv/bin/python -m pipeline.cli trace --source ~/BlueBirdSourceCode/BOOT-INF/classes/com/bmdyy/bluebird --db data/recon.db --model whiterabbitneo-33b:latest`
+  and a real pass against this corpus found Stage 4 verdicts `exploitable_path`
+  for two known triage false positives (`resetPOST`, `createPost`) even
+  though it was shown their parameterized calls directly -- it just restated
+  the method's shape instead of catching the parameterization. Same
+  "advisory, not authoritative" rule as triage/audit applies here.
+- **A method with several concatenated variables, only some of which are
+  actually exploitable, still gets one verdict for the whole thing** --
+  Stage 4 doesn't break that down per variable. `AuthController.signupPOST`
+  is the concrete example: three of its four concatenated variables are
+  exploitable and one (`passwordHash`, a BCrypt hash) isn't, and Stage 3/4's
+  structured output doesn't distinguish them any better than Stage 1 did.
+
+Three companion writeups work through this in much more depth than fits
+here, each demonstrating a different way of confirming the same answer:
+`tests/searching_for_strings_pipeline_writeup.md` (Stage 0-2 only),
+`tests/searching_for_strings_stage3_4_writeup.md` (adds Stage 3/4, finds no
+improvement on this particular question, and explains exactly why), and
+`tests/searching_for_strings_live_debug_writeup.md` (confirms the same
+answer by attaching a live debugger to a running BlueBird instead of
+reading or querying anything statically -- see `tests/live-debugging.md`
+for the underlying technique). `ARCHITECTURE.md`'s "Known boundaries"
+section is the terse, reference-style version of everything in this
+subsection.
 
 ## Teardown / archiving after an engagement
 
