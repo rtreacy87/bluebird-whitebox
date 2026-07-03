@@ -32,7 +32,14 @@ Stage 4.5: Dynamic Verification Probe (deterministic firing,
            local-only, non-destructive, LLM only for
            ambiguous-result interpretation)          -> dynamic_probe_results
 Stage 5: Human Verification Gate                     -> findings.verified_by_human
-Stage 6: Findings Store                              -> findings (report source of truth)
+Stage 6: Findings Store / Report Export (deterministic,
+         reads only verified_by_human=1 AND status=
+         'confirmed' findings)                       -> report_exports
+                                                          + a human-readable report
+                                                          + a versioned JSON candidate
+                                                            export for sqlmap-wrapper/
+                                                            (a separately-governed tool,
+                                                            see sqlmap-wrapper/CLAUDE.md)
 ```
 
 Design principle: **the LLM never decides what to look at next.** All traversal,
@@ -69,6 +76,9 @@ a highly agentic model; do not refactor toward an autonomous agent loop.
    free, the same caution already applied to cross-file resolution above.
 6. Human verification gate and findings export are last — they depend on
    everything upstream (now including wherever Stage 4.5 was run) being stable.
+   Both are now built: Stage 5's write-side is `pipeline/stage5_verify/logger.py`
+   (`log-finding`); Stage 6 is `pipeline/stage6_report/` (`export-report`), see
+   "Reporting (Stage 6)" below.
 
 ## Database
 
@@ -242,6 +252,40 @@ external/hosted API" rule this document already states, applied to Stage
 and the deterministic classification rules need no model at all — this
 mirrors Stage 3's deterministic graph walk vs. Stage 4's LLM judgment split
 above.
+
+## Reporting (Stage 6)
+
+Stage 6 (`pipeline/stage6_report/`, `export-report` CLI command) is
+deterministic — it reads `findings` and renders it, it never queries an
+LLM, and it never decides which rows count as reportable. Per "Database"
+above, the one hard rule this stage exists to enforce is: **only rows with
+`verified_by_human=1 AND status='confirmed'` ever leave the DB** in any
+exported format. `pipeline/stage6_report/query.py`'s
+`assemble_finding_records()` is the single query both renderers below read
+from — there is exactly one place this filter is applied, not two
+independently-maintained guesses at the same rule.
+
+Two output formats, both provenance-tracked in `report_exports`:
+- **`--format markdown`**: a human-readable report for the engagement
+  writeup — one section per finding, with triage/trace narrative and
+  Stage 4.5 dynamic-probe evidence (a per-parameter classification table)
+  when available.
+- **`--format sqlmap-json`**: a versioned JSON export
+  (`schema_version: "sqlmap_candidate_v1"`, documented in
+  `pipeline/stage6_report/schemas/sqlmap_candidate_v1.schema.json`) — the
+  input contract for `sqlmap-wrapper/`, a separate, separately-governed
+  tool (see `sqlmap-wrapper/CLAUDE.md`) that this repo's own "no automated
+  exploitation" rule already reserves sqlmap for. This export is
+  deliberately narrowed to parameters Stage 4.5 already showed reactive
+  (`error`/`transformed` classifications) — a finding with no such evidence
+  still exports as one candidate with `target_param_name: null` and a
+  human-actionable note, never silently dropped.
+
+**Bump `render_sqlmap_json.SCHEMA_VERSION` (and add a new versioned sibling
+schema file, never edit the old one in place) if this export's shape ever
+changes** — `sqlmap-wrapper/` validates against this exact contract by
+hand (no shared library dependency), so a silent shape change on one side
+would break the other without either test suite noticing.
 
 ## Testing
 

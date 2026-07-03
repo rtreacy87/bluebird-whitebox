@@ -230,13 +230,23 @@ CREATE TABLE findings (
     endpoint                TEXT,                    -- e.g. '/find-user'
     vuln_class              TEXT,                    -- e.g. 'blind_sqli','error_based','second_order'
     verified_by_human       BOOLEAN NOT NULL DEFAULT 0,
-    verification_method     TEXT CHECK(verification_method IN ('live_debug','query_log',
-                                                                  'manual_payload', NULL)),
+    verification_method     TEXT CHECK(verification_method IS NULL OR verification_method IN
+                                            ('live_debug','query_log','manual_payload')),
     verification_notes      TEXT,
     severity                TEXT,
     status                  TEXT NOT NULL CHECK(status IN ('confirmed','rejected','needs_review'))
                                   DEFAULT 'needs_review',
     reviewed_at             TIMESTAMP
+);
+
+-- Stage 6: provenance log of every export run (report_exports is a log of
+-- exports produced, not a table anything else joins against or reads back).
+CREATE TABLE report_exports (
+    export_id      INTEGER PRIMARY KEY,
+    format         TEXT NOT NULL CHECK(format IN ('markdown','sqlmap_json')),
+    output_path    TEXT NOT NULL,
+    finding_count  INTEGER NOT NULL,
+    exported_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ============================================================
@@ -273,6 +283,9 @@ CREATE INDEX idx_trace_results_queue_id ON trace_results(queue_id);
 
 -- Findings export filter (verified_by_human=1 AND status='confirmed').
 CREATE INDEX idx_findings_status        ON findings(status, verified_by_human);
+
+-- Stage 6 export provenance lookups.
+CREATE INDEX idx_report_exports_format  ON report_exports(format);
 
 -- Input source lookup (entry points into the codebase).
 CREATE INDEX idx_input_sources_symbol   ON input_sources(symbol_id);

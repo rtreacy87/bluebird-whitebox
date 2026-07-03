@@ -10,14 +10,20 @@ Usage:
     python -m pipeline.cli setup-target-env    --source <dir> --schema-sql <file> --db-user U --db-password P --db-name N --db data/recon.db
     python -m pipeline.cli dynamic-probe       --env-id <N> --request-templates <file> --db data/recon.db
     python -m pipeline.cli teardown-target-env --env-id <N> --db data/recon.db
+    python -m pipeline.cli export-report --db data/recon.db --format markdown --out report.md
+    python -m pipeline.cli export-report --db data/recon.db --format sqlmap-json --out candidates.json
     python -m pipeline.cli coverage      --db data/recon.db
 
-Stage 6 (findings report export) is deliberately not implemented yet per
-CLAUDE.md's build order. `log-finding` is Stage 5's write-side only -- a
-human records what they already verified; nothing here decides anything.
+`log-finding` is Stage 5's write-side only -- a human records what they
+already verified; nothing here decides anything.
 `setup-target-env`/`dynamic-probe`/`teardown-target-env` are Stage 4.5
 (dynamic verification) -- see CLAUDE.md's "Dynamic Verification (Stage 4.5)"
 section for the hard local-only guardrail and probe-set scope boundary.
+`export-report` is Stage 6: reads only `findings` rows with
+`verified_by_human=1 AND status='confirmed'` and renders them as either a
+human-readable Markdown report or a versioned `sqlmap_candidate_v1` JSON
+file consumed by the separately-governed `sqlmap-wrapper/` tool -- see
+CLAUDE.md's "Reporting (Stage 6)" section.
 """
 
 import argparse
@@ -34,6 +40,7 @@ from pipeline.stage3_trace.builder import enqueue_trace_targets
 from pipeline.stage4_deep_trace.deep_trace import trace_all_pending
 from pipeline.stage4_5_dynamic_verify import env_setup, orchestrator
 from pipeline.stage5_verify.logger import InvalidFindingError, log_finding
+from pipeline.stage6_report.exporter import export_report
 
 DEFAULT_MODEL = "whiterabbitneo-33b:latest"
 
@@ -162,6 +169,15 @@ def cmd_dynamic_probe(args):
         runner = LLMRunner(conn, client)
     stats = orchestrator.run_all_pending(conn, args.env_id, request_templates, runner=runner)
     print(stats)
+
+
+def cmd_export_report(args):
+    conn = db.connect(args.db)
+    request_templates = None
+    if args.request_templates:
+        request_templates = json.loads(Path(args.request_templates).read_text())
+    export_id, finding_count = export_report(conn, args.format, args.out, request_templates=request_templates)
+    print(f"export_id={export_id} findings={finding_count} -> {args.out}")
 
 
 def cmd_coverage(args):
@@ -304,6 +320,21 @@ def build_parser():
         help="skip local-LLM interpretation; leave ambiguous results as 'ambiguous' for manual review",
     )
     p_dynamic_probe.set_defaults(func=cmd_dynamic_probe)
+
+    p_export_report = sub.add_parser(
+        "export-report",
+        help="Stage 6: render confirmed+verified findings as a report or an sqlmap-wrapper candidate export",
+    )
+    p_export_report.add_argument("--db", default="data/recon.db")
+    p_export_report.add_argument("--format", required=True, choices=["markdown", "sqlmap-json"])
+    p_export_report.add_argument("--out", required=True, help="output file path")
+    p_export_report.add_argument(
+        "--request-templates",
+        dest="request_templates",
+        help="sqlmap-json only: same request-templates.json Stage 4.5 uses, to carry sibling "
+        "request-body values (param_defaults) into the export",
+    )
+    p_export_report.set_defaults(func=cmd_export_report)
 
     p_coverage = sub.add_parser("coverage", help="print Stage 0 -> Stage 1 coverage as a query, not a stored field")
     p_coverage.add_argument("--db", default="data/recon.db")

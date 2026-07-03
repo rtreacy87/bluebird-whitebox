@@ -16,13 +16,17 @@ See `CLAUDE.md` for the full design spec and build-order rationale, and
 ## Current scope
 
 Implemented: **Stage 0 (static index) → Stage 1 (triage) → Stage 2 (audit)
-→ Stage 3 (deterministic trace queue) → Stage 4 (LLM deep-trace)**, plus
-Stage 5's write-side (`log-finding` -- a human records a finding they've
-already manually verified).
+→ Stage 3 (deterministic trace queue) → Stage 4 (LLM deep-trace) → Stage
+4.5 (dynamic verification against a disposable local replica) → Stage 5
+(human verification gate) → Stage 6 (findings report export)**. The whole
+pipeline is now built end to end, from static index to a report you can
+hand to a client or feed to `sqlmap-wrapper/` (a separate, separately-
+governed tool -- see "Stage 4.5"/"Stage 6" below and
+`sqlmap-wrapper/CLAUDE.md`).
 
-Not yet built: Stage 6 (findings report export), and cross-file call
-resolution (Stage 3's graph walk is intra-file-only, same boundary as
-Stage 0 -- see `ARCHITECTURE.md`'s "Known boundaries"). Stage 3/4 trace
+Not yet built: cross-file call resolution (Stage 3's graph walk is
+intra-file-only, same boundary as Stage 0 -- see `ARCHITECTURE.md`'s
+"Known boundaries"). Stage 3/4 trace
 multi-step, same-file data flow (e.g. "attacker-controlled value gets
 stored by one method, then read back into an unsafe query by another") --
 see the worked `/profile/{id}` example in `EXPECTED_FINDINGS.md`, which
@@ -433,8 +437,49 @@ already done and a breakpoint has already told you something concrete.
    ```
    Nothing outside this table should ever be treated as report-ready --
    per `CLAUDE.md`, only rows with `verified_by_human = 1 AND status =
-   'confirmed'` are meant to leave the internal DB in an exported report
-   (Stage 6, not yet built, will be what actually automates that filter).
+   'confirmed'` are meant to leave the internal DB in an exported report.
+   `export-report` (Stage 6, see "Stage 6: reporting" below) is what
+   actually automates that filter, rather than a human re-typing this query
+   by hand every time.
+
+## Stage 6: reporting
+
+Once a finding is logged and `confirmed`, render it as a report:
+
+```bash
+# Human-readable Markdown, for a client writeup:
+.venv/bin/python -m pipeline.cli export-report \
+    --db data/recon.db --format markdown --out report.md
+
+# Versioned JSON candidate export, for sqlmap-wrapper/ (a separate,
+# separately-governed tool -- see sqlmap-wrapper/CLAUDE.md and README.md):
+.venv/bin/python -m pipeline.cli export-report \
+    --db data/recon.db --format sqlmap-json --out candidates.json \
+    --request-templates request-templates.json
+```
+
+Both formats read from the exact same query (`pipeline/stage6_report/
+query.py`'s `assemble_finding_records()`), applying the hard
+`verified_by_human=1 AND status='confirmed'` filter exactly once -- there is
+no separate export path that could apply a looser rule. `--request-templates`
+is the same file Stage 4.5 uses (`endpoint`/`http_method`/`param_defaults`
+per method); it's optional, but a `sqlmap-json` candidate for a POST
+endpoint needs it to carry a usable request body -- without it,
+`sqlmap-wrapper/`'s `flags.build_args()` will refuse to build a command for
+that candidate rather than guess one.
+
+The `sqlmap-json` export is deliberately narrowed: only parameters whose
+Stage 4.5 probe battery showed at least one `error`/`transformed`
+classification are included (e.g. for `signupPOST`, `name`/`username`/
+`email` export, `password`/`repeatPassword` don't -- see
+`DATA_DICTIONARY.md`'s `dynamic_probe_results` entry for why). A finding
+with no dynamic-probe evidence at all still exports as one candidate with
+`target_param_name: null` and a note that the injection point needs manual
+determination -- nothing is silently dropped from the export.
+
+Every export is logged in `report_exports` (format, output path, finding
+count, timestamp) -- the same "record what happened" habit as `llm_runs`/
+`target_environments`.
 
 ## When this tool is appropriate
 
@@ -464,10 +509,15 @@ already done and a breakpoint has already told you something concrete.
   deliberately narrow -- four fixed, non-destructive metacharacter probes
   against a local replica, to confirm a hypothesis and prioritize a
   candidate list. It never attempts UNION-based extraction, blind/time-based
-  oracles, stacked queries, or auth bypass. Once Stage 4.5 tells you *which*
-  parameter is worth pursuing and roughly how the sink reacts, actual
-  exploitation-technique automation against the real target is still a
-  separate, human-directed step outside this codebase.
+  oracles, stacked queries, or auth bypass. `export-report --format
+  sqlmap-json` (Stage 6) hands that candidate list to `sqlmap-wrapper/` --
+  a separate tool with its own `CLAUDE.md`, not bound by this repo's own
+  restrictions, since it's exactly the "separate, human-directed tool" this
+  repo's design always pointed to. Even there, a real end-to-end run found
+  that `sqlmap`'s default technique set doesn't always confirm what Stage
+  4.5 already proved (see `sqlmap-wrapper/CLAUDE.md`'s "A real, discovered
+  limitation") -- so a `not_confirmed` result downstream is not the same
+  claim as "not exploitable."
 - **Unauthorized testing.** This is a defensive-assessment recon aid for
   engagements you're authorized to perform, not a scanning tool to point at
   arbitrary targets.

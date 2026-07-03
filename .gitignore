@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 data/*.db
 data/*.db-journal
+sqlmap-wrapper/data/*.db
+sqlmap-wrapper/data/*.db-journal
 .pytest_cache/

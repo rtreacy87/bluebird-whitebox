@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sqlmap_candidate_v1",
+  "title": "Stage 6 sqlmap-candidate export",
+  "description": "Documentation-only shape reference for the Stage 6 -> sqlmap-wrapper handoff. Not executed or imported by any Python code in this repo -- both sides implement hand-rolled validation (render_sqlmap_json.py writes this shape; sqlmap-wrapper/sqlmap_wrapper/import_candidates.py's validate_candidate() checks it) rather than depending on a JSON Schema validation library, consistent with this project's minimal-dependency convention. Bump the version suffix and add a new sibling file if this shape ever changes -- never edit this file in place.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "candidates"],
+  "properties": {
+    "schema_version": { "const": "sqlmap_candidate_v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["finding_id", "endpoint", "vuln_class", "severity",
+                     "order_hypothesis", "target_param_name", "param_defaults",
+                     "dbms_hint", "evidence", "note"],
+        "properties": {
+          "finding_id": { "type": "integer", "description": "bluebird-whitebox findings.finding_id -- not a real cross-DB FK, see sqlmap-wrapper/DATA_DICTIONARY.md" },
+          "endpoint": { "type": "string", "description": "route path only, e.g. '/signup' -- never a real host" },
+          "http_method": { "type": ["string", "null"], "enum": ["GET", "POST", null] },
+          "vuln_class": { "type": ["string", "null"] },
+          "severity": { "type": ["string", "null"] },
+          "order_hypothesis": { "type": ["string", "null"], "enum": ["first_order", "second_order", null] },
+          "target_param_name": { "type": ["string", "null"], "description": "null means: no reactive dynamic-probe evidence exists for this finding -- injection point must be determined manually, see `note`" },
+          "param_defaults": { "type": ["object", "null"], "description": "sibling request-body values (e.g. signupPOST's username/email/password alongside whichever field is target_param_name), sourced from the same human-supplied request-templates.json Stage 4.5 uses. null if no template was supplied at export time or none matched -- the wrapper must then ask a human before it can build a request body for this candidate." },
+          "dbms_hint": { "type": ["string", "null"], "enum": ["postgresql", "mysql", "mssql", null], "description": "passed to sqlmap's --dbms verbatim" },
+          "evidence": {
+            "type": "object",
+            "properties": {
+              "path_narrative": { "type": ["string", "null"] },
+              "probe_classifications": { "type": "object", "description": "{probe_name: classification}, only present when target_param_name is non-null" },
+              "sample_log_snippet": { "type": ["string", "null"] }
+            }
+          },
+          "note": { "type": ["string", "null"], "description": "human-actionable note, set whenever target_param_name is null" }
+        }
+      }
+    }
+  }
+}

@@ -79,28 +79,47 @@ is a *pipeline* of scripted stages rather than an agent loop.
                                          │         dynamic_probe_results,
                                          │         llm_runs (interpret only)
                                          ▼
-              ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-                NOT YET BUILT (see CLAUDE.md build order -- deliberately
-                gated behind validated Stage 0-4, not a missing feature)
-
-                Stage 5 -- Human Verification Gate
-                Stage 6 -- Findings Store / report export
-              ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+                    ┌────────────────────────────────────────────--┐
+                    │  Stage 5 -- Human Verification Gate           │
+                    │  (write-side only -- a human records a        │
+                    │   verdict they already reached)               │
+                    │  pipeline/stage5_verify/logger.py             │
+                    └───────────────────┬────────────────────────--┘
+                                         │ reads: trace_results, triage_results
+                                         │ writes: findings
+                                         ▼
+                    ┌────────────────────────────────────────────--┐
+                    │  Stage 6 -- Findings Store / Report Export    │
+                    │  (deterministic -- reads only                 │
+                    │   verified_by_human=1 AND status='confirmed') │
+                    │  pipeline/stage6_report/                      │
+                    └───────────────────┬────────────────────────--┘
+                                         │ reads: findings, trace_results,
+                                         │        trace_queue, triage_results,
+                                         │        dynamic_probe_batches/results
+                                         │ writes: report_exports
+                                         ▼
+                          a Markdown report, or a versioned JSON
+                          candidate export for sqlmap-wrapper/ --
+                          a separate, separately-governed tool
+                          (see sqlmap-wrapper/CLAUDE.md)
 ```
 
-Everything left of that dashed line is implemented and validated against the
-BlueBird corpus (Stage 3/4's validation run: `enqueue-trace` produced 17
-`trace_queue` rows from the corpus's 17 `sink_type='sql_unsafe'` triage rows,
-and a full `trace` pass correctly traced all three regression vulnerabilities
--- `/find-user`, `/forgot`, `/profile/{id}` -- as `exploitable_path`; Stage
-4.5's own validation run against a disposable local BlueBird replica is
-covered in "Stage 4.5, step by step" below; see "Known boundaries" below for
-what these runs also revealed about Stage 4's reliability and Stage 4.5's
-classification limits). Everything right of the dashed line is spec'd in
-`CLAUDE.md` but intentionally not started -- also note **cross-file call
-resolution** isn't built either; Stage 0 only resolves calls within a single
-file, and Stage 3's graph walk is intra-file-only for the same reason (see
-"Known boundaries" below).
+Every stage above is implemented and validated against the BlueBird corpus
+(Stage 3/4's validation run: `enqueue-trace` produced 17 `trace_queue` rows
+from the corpus's 17 `sink_type='sql_unsafe'` triage rows, and a full `trace`
+pass correctly traced all three regression vulnerabilities -- `/find-user`,
+`/forgot`, `/profile/{id}` -- as `exploitable_path`; Stage 4.5's own
+validation run against a disposable local BlueBird replica is covered in
+"Stage 4.5, step by step" below; Stage 6's own validation run is covered in
+"Stage 6, step by step" below; see "Known boundaries" below for what these
+runs also revealed about Stage 4's reliability, Stage 4.5's classification
+limits, and a real correctness bug found and fixed while building Stage 6).
+The one thing genuinely not started is **cross-file call resolution** --
+Stage 0 only resolves calls within a single file, and Stage 3's graph walk
+is intra-file-only for the same reason (see "Known boundaries" below); this
+remains a deliberate, measured decision per `CLAUDE.md`'s build order, not a
+missing feature.
 
 ## Directory map
 
@@ -234,8 +253,71 @@ pipeline/
                           candidate with no matching entry is skipped and
                           counted, never fabricated.
 
+  stage5_verify/logger.py   `log_finding(conn, ...)`: the entire Stage 5
+                          write-side. Validates `verification_method`/
+                          `status` against `schema.sql`'s CHECK values
+                          before writing anything (`InvalidFindingError` on
+                          a bad value or a `source_trace_id`/
+                          `source_triage_result_id` that doesn't exist),
+                          then inserts one `findings` row with
+                          `verified_by_human` defaulting to `True` -- this
+                          command exists specifically to record that a
+                          human did the verifying. No workflow beyond this
+                          one write command exists yet (no review queue) --
+                          see "Extending this" below.
+
+  stage6_report/            Stage 6: deterministic report/export rendering,
+                          no LLM call anywhere in this package.
+    query.py                 `assemble_finding_records(conn)` -- the one
+                          canonical query both renderers below read from,
+                          applying the hard `verified_by_human=1 AND
+                          status='confirmed'` filter exactly once. Resolves
+                          triage/trace context via whichever of
+                          `source_triage_result_id` (direct) or
+                          `source_trace_id` (indirect, via
+                          `trace_queue.origin_triage_result_id`) is
+                          non-null, and folds any `dynamic_probe_batches`/
+                          `dynamic_probe_results` rows into a per-parameter
+                          `{probe_name: classification}` map.
+    dbms_hints.py             `guess_dbms(log_snippet)` -- a small, separate
+                          marker table (not reused from `classify.py`'s
+                          `_ERROR_MARKERS`, a different, broader job),
+                          passed straight through to sqlmap's `--dbms` flag
+                          verbatim by the downstream wrapper tool.
+    render_markdown.py        Human-readable report: one section per
+                          finding, with triage/trace narrative and a
+                          per-parameter probe-classification table when
+                          Stage 4.5 evidence exists.
+    render_sqlmap_json.py     Builds the versioned `sqlmap_candidate_v1`
+                          JSON export -- one candidate per (finding,
+                          parameter) pair, filtered to parameters with at
+                          least one `error`/`transformed` classification
+                          (deliberately excluding parameters Stage 4.5
+                          already showed non-reactive), with a
+                          `target_param_name: null` + human-actionable
+                          `note` fallback for findings with no dynamic
+                          evidence at all, or where none of the tested
+                          parameters reacted -- nothing vanishes silently.
+                          Also folds in `param_defaults` from an optional
+                          human-supplied `request_templates.json` (the same
+                          file Stage 4.5 uses), since a POST candidate needs
+                          a request body shape sqlmap can actually send.
+    schemas/sqlmap_candidate_v1.schema.json   Documentation-only shape
+                          reference for the export -- never imported or
+                          executed by Python on either side of the
+                          Stage 6 / sqlmap-wrapper boundary; both sides
+                          validate by hand instead (no `jsonschema`
+                          dependency, matching this project's existing
+                          minimal-dependency preference).
+    exporter.py               `export_report(conn, fmt, out_path,
+                          request_templates=None)`: query -> render ->
+                          write file -> insert one `report_exports` row.
+                          The `export-report` CLI command's entire body.
+
 prompts/
-  triage_v1.txt, audit_v1.txt, trace_v1.txt, dynamic_interpret_v1.txt
+  triage_v1.txt, audit_v1.txt, trace_v1.txt, dynamic_interpret_v1.txt,
+  sqlmap_interpret_v1.txt (in sqlmap-wrapper/prompts/, a separate
+  versioned-prompt set for that separately-governed tool)
                           Versioned system prompts. CLAUDE.md's rule: edit
                           by incrementing the version suffix, never overwrite
                           in place -- llm_runs.prompt_version must always
@@ -278,7 +360,27 @@ tests/
                           the same `RUN_LLM_TESTS=1` gating convention,
                           renamed for what it actually gates here (a
                           container + process, not necessarily an LLM call).
+  test_stage5_verify.py           Fast, no LLM, no corpus dependency --
+                          `log_finding()` only ever writes to an
+                          already-initialized schema. Includes a direct
+                          schema-level regression test
+                          (`test_schema_check_itself_rejects_bad_
+                          verification_method`) for a real bug found while
+                          building Stage 6 (see "Known boundaries" below).
+  test_stage6_report.py           Fast, no LLM, no corpus dependency --
+                          Stage 6 only ever reads an already-populated DB.
+                          Runs against a throwaway copy of the real,
+                          already-seeded `data/recon.db` (not a synthetic
+                          fixture) so assertions reflect the genuine
+                          `signupPOST` finding/trace/dynamic-probe shape
+                          produced by earlier stages, not a hand-built
+                          approximation of it.
 ```
+
+`sqlmap-wrapper/tests/test_sqlmap_wrapper.py` is a separate suite for the
+separately-governed `sqlmap-wrapper/` tool -- see that subtree's own
+`CLAUDE.md`/`README.md` for its two-tier convention
+(`RUN_SQLMAP_TESTS=1` gates the tier that fires a real `sqlmap` subprocess).
 
 ## The database is the integration contract
 
@@ -430,6 +532,50 @@ showed `double_quote`/`backslash` -> `passthrough_unmodified` -- a genuine
 finding beyond what the manual session checked, confirming neither character
 is special to this sink in standard PostgreSQL string-literal syntax.
 
+## Stage 6, step by step
+
+`export-report` (Stage 6) has no `--model`/`--host` -- like Stage 3, it's
+pure Python and never touches Ollama:
+
+1. `assemble_finding_records()` selects every `findings` row matching the
+   hard `verified_by_human=1 AND status='confirmed'` filter, resolves its
+   triage/trace context (via whichever of `source_triage_result_id` or
+   `source_trace_id` -> `trace_queue.origin_triage_result_id` is non-null),
+   and folds in any `dynamic_probe_batches`/`dynamic_probe_results` rows as
+   a per-parameter list.
+2. `--format markdown` renders one section per finding with that context;
+   `--format sqlmap-json` filters each finding's parameters down to ones
+   with an `error`/`transformed` classification, resolves a `dbms_hint` via
+   a small string-match heuristic against the reactive probe's log
+   snippet, and (if `--request-templates` was given) attaches the same
+   sibling `param_defaults` Stage 4.5 uses, so a downstream POST candidate
+   carries a usable request-body shape.
+3. `exporter.export_report()` writes the rendered file and inserts one
+   `report_exports` row recording the format, path, and finding count.
+
+Validated end to end against real BlueBird's actual seeded data (not a
+synthetic fixture): the one real `findings` row
+(`/signup`, confirmed via `live_debug`) rendered correctly in both formats,
+with `--format sqlmap-json` correctly including `name`/`username`/`email`
+(each showing an `error` classification on `single_quote`) and correctly
+excluding `password`/`repeatPassword` (both `rejected` on every probe, see
+`DATA_DICTIONARY.md`'s known BCrypt-hash caveat) from the exported
+candidate list.
+
+**A real, discovered gap while validating the Stage 6 -> sqlmap-wrapper
+handoff, fixed before it shipped:** the first version of the
+`sqlmap_candidate_v1` export carried only the endpoint path and injection
+parameter, with no sibling request-body values -- enough to identify *which*
+parameter to test, but not enough to actually build a working `sqlmap
+--data` string for a POST endpoint (sqlmap needs `username`/`email`/
+`password`/etc. alongside whichever field is being probed, the same
+sibling-parameter need Stage 4.5's own `request-templates.json` exists to
+solve). Fixed by threading an optional `--request-templates` file through
+`export-report` and attaching its `param_defaults` to each exported
+candidate -- caught during the real end-to-end wrapper validation run
+described in `sqlmap-wrapper/README.md`, not anticipated in the original
+design.
+
 ## Key design decisions (and why)
 
 **Hallucination detection via nullable `symbol_id`.** `triage_results` keeps
@@ -567,6 +713,24 @@ every method.
   outcome), the container and app process from `setup-target-env` are left
   running until `teardown-target-env` is run explicitly -- there is no
   crash-handler or timeout that tears them down on the pipeline's behalf.
+- **A real `CHECK` constraint bug was found and fixed while building
+  Stage 6.** `findings.verification_method`'s original `CHECK` included a
+  bare `NULL` literal inside an `IN (...)` list -- a pattern that silently
+  does not reject bad values in SQLite (see `DATA_DICTIONARY.md`'s
+  `findings` entry for the full mechanism). Fixed to `CHECK(col IS NULL OR
+  col IN (...))`, migrated live via a table rebuild preserving the one real
+  row, with a direct schema-level regression test added
+  (`tests/test_stage5_verify.py`). `sqlmap-wrapper/schema.sql` had the
+  identical latent bug in two columns, caught and fixed before that schema
+  ever shipped with real data.
+- **`sqlmap-wrapper/`'s candidates have no cross-database foreign key back
+  to this repo's `findings.finding_id`**, and second-order candidates
+  (`order_hypothesis='second_order'`) get no automatic `--second-url`
+  sqlmap flag -- both are deliberate, documented gaps in that subtree, not
+  oversights; see `sqlmap-wrapper/CLAUDE.md` and `DATA_DICTIONARY.md` for
+  the full reasoning. That subtree is a separate, separately-governed tool
+  (its own `CLAUDE.md`), not an extension of this repo's own rules -- see
+  "Reporting (Stage 6)" in `CLAUDE.md` for the exact handoff contract.
 
 ## Future direction: a real code-graph backend (Joern or similar) under Stage 0/3
 
@@ -655,3 +819,16 @@ migration on an existing DB -- SQLite can't ALTER a CHECK directly, see
 a new evidence signal beyond the existing error/passthrough/transformed/
 rejected checks. Per `CLAUDE.md`, this is a deliberate, versioned code
 change -- never a per-run or LLM-chosen addition.
+
+**Adding a new Stage 6 export format**: add a `render_<format>.py` module
+taking `assemble_finding_records()`'s output, wire it into
+`exporter.export_report()`'s format dispatch, and add the new format string
+to `schema.sql`'s `report_exports.format` CHECK (another full-table-rebuild
+migration, same reason as above). **Changing the `sqlmap_candidate_v1`
+shape specifically** is a shared-contract change, not a local one: bump
+`render_sqlmap_json.SCHEMA_VERSION`, add a new versioned sibling file under
+`schemas/` (never edit `sqlmap_candidate_v1.schema.json` in place), and
+update `sqlmap-wrapper/sqlmap_wrapper/import_candidates.py`'s
+`validate_candidate()`/`SCHEMA_VERSION` in the same change -- the two sides
+validate this shape independently by hand (no shared schema library), so
+they only stay in sync if both are updated together.

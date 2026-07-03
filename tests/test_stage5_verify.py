@@ -4,6 +4,8 @@ No LLM, no BlueBird corpus dependency -- log_finding only ever writes to an
 already-initialized schema, so these run against a fresh empty DB.
 """
 
+import sqlite3
+
 import pytest
 
 from pipeline import db
@@ -62,6 +64,24 @@ def test_invalid_status_rejected_before_insert(conn):
 def test_source_trace_id_must_exist(conn):
     with pytest.raises(InvalidFindingError):
         log_finding(conn, verification_method="live_debug", source_trace_id=999)
+
+
+def test_schema_check_itself_rejects_bad_verification_method(conn):
+    """Regression test for a real bug: CHECK(col IN ('a','b', NULL)) doesn't
+    actually reject bad non-null values in SQLite -- a NULL literal inside
+    an IN(...) list makes the whole expression evaluate to NULL/unknown
+    (not FALSE) for any value that isn't 'a' or 'b', and a CHECK constraint
+    treats NULL as satisfied. log_finding()'s own Python-level validation
+    happens to catch this before ever reaching the DB (see the test above),
+    which is exactly why this went unnoticed -- but the schema's own CHECK
+    must be correct independently, since it's the last line of defense
+    against anything else that might someday write to `findings` directly.
+    The fix is `CHECK(col IS NULL OR col IN (...))`, not a NULL literal
+    inside the IN(...) list."""
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO findings (verification_method, status) VALUES ('bogus_method', 'confirmed')"
+        )
 
 
 def test_source_triage_result_id_must_exist(conn):

@@ -622,6 +622,49 @@ read directly by a report.
 - `confirmed` — human has confirmed this is a real finding. Combined with `verified_by_human = 1`, this is the only state eligible for export.
 - `rejected` — human has determined this is not a real finding.
 
+**A real, fixed correctness bug found while building Stage 6:**
+`verification_method`'s `CHECK` constraint originally read `CHECK(verification_method
+IN ('live_debug','query_log','manual_payload', NULL))` — a NULL literal placed
+*inside* an `IN (...)` list. This does not do what it looks like it does: for
+any value that isn't one of the three real options, SQL's `IN` evaluates to
+`NULL` (unknown), not `FALSE`, once a NULL is present in the list — and a
+`CHECK` constraint treats `NULL` as satisfied, not violated. In practice this
+meant `INSERT INTO findings (verification_method, ...) VALUES ('bogus_method',
+...)` was silently **accepted** by the schema itself; only
+`pipeline/stage5_verify/logger.py`'s own Python-level validation (raising
+`InvalidFindingError` before the insert) was actually catching bad values,
+which is why this went unnoticed until directly tested. Fixed to
+`CHECK(verification_method IS NULL OR verification_method IN (...))`,
+migrated live via a table rebuild (SQLite can't `ALTER` a `CHECK` directly),
+preserving the one real row that existed. See
+`tests/test_stage5_verify.py::test_schema_check_itself_rejects_bad_verification_method`
+for the regression test, and `sqlmap-wrapper/schema.sql` for two more
+columns (`candidates.http_method`/`order_hypothesis`) that had the identical
+latent bug, caught and fixed before that schema ever shipped with real data
+in it.
+
+### `report_exports`
+
+Stage 6
+
+One row per `export-report` run — a provenance log, never itself read by
+anything downstream.
+
+**Why:** Matches the "record what happened, when, with what" habit already
+established by `llm_runs`/`target_environments` — if an exported report or
+`sqlmap-wrapper/` candidate file looks stale or wrong later, this is where
+you check exactly when it was produced and how many findings it covered,
+without needing to trust a filename or a human's memory of when they ran
+the command.
+
+| Column | Type | Description |
+|---|---|---|
+| `export_id` | INTEGER (PK) | Unique identifier for this export. |
+| `format` | TEXT | `markdown` or `sqlmap_json`. |
+| `output_path` | TEXT | Where the rendered file was written. |
+| `finding_count` | INTEGER | How many `findings` rows this export covered — always computed from the same hard filter (`verified_by_human=1 AND status='confirmed'`) `assemble_finding_records()` applies, never a separately-tracked count that could drift from it. |
+| `exported_at` | TIMESTAMP | When this export ran. |
+
 ## Indexes
 
 Indexes support the coverage/hallucination queries and call-graph/trace
