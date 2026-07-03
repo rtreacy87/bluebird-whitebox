@@ -64,6 +64,21 @@ is a *pipeline* of scripted stages rather than an agent loop.
                                          │ writes: trace_results, llm_runs,
                                          │         trace_queue.status
                                          ▼
+                    ┌────────────────────────────────────────────--┐
+                    │  Stage 4.5 -- Dynamic Verification Probe      │
+                    │  (deterministic firing, local-only,           │
+                    │   non-destructive; LLM only for ambiguous-    │
+                    │   result interpretation)                      │
+                    │  pipeline/stage4_5_dynamic_verify/            │
+                    │  prompts/dynamic_interpret_v1.txt              │
+                    └───────────────────┬────────────────────────--┘
+                                         │ reads: trace_results, trace_queue,
+                                         │        input_sources
+                                         │ writes: target_environments,
+                                         │         dynamic_probe_batches,
+                                         │         dynamic_probe_results,
+                                         │         llm_runs (interpret only)
+                                         ▼
               ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
                 NOT YET BUILT (see CLAUDE.md build order -- deliberately
                 gated behind validated Stage 0-4, not a missing feature)
@@ -77,13 +92,15 @@ Everything left of that dashed line is implemented and validated against the
 BlueBird corpus (Stage 3/4's validation run: `enqueue-trace` produced 17
 `trace_queue` rows from the corpus's 17 `sink_type='sql_unsafe'` triage rows,
 and a full `trace` pass correctly traced all three regression vulnerabilities
--- `/find-user`, `/forgot`, `/profile/{id}` -- as `exploitable_path`; see
-"Known boundaries" below for what that run also revealed about Stage 4's
-reliability). Everything right of the dashed line is spec'd in `CLAUDE.md`
-but intentionally not started -- also note **cross-file call resolution**
-isn't built either; Stage 0 only resolves calls within a single file, and
-Stage 3's graph walk is intra-file-only for the same reason (see "Known
-boundaries" below).
+-- `/find-user`, `/forgot`, `/profile/{id}` -- as `exploitable_path`; Stage
+4.5's own validation run against a disposable local BlueBird replica is
+covered in "Stage 4.5, step by step" below; see "Known boundaries" below for
+what these runs also revealed about Stage 4's reliability and Stage 4.5's
+classification limits). Everything right of the dashed line is spec'd in
+`CLAUDE.md` but intentionally not started -- also note **cross-file call
+resolution** isn't built either; Stage 0 only resolves calls within a single
+file, and Stage 3's graph walk is intra-file-only for the same reason (see
+"Known boundaries" below).
 
 ## Directory map
 
@@ -96,8 +113,10 @@ pipeline/
                           constants that must trace back to bench/
                           context_benchmark.py, never a guess.
   cli.py                  argparse entrypoint: index / triage / audit /
-                          enqueue-trace / trace / coverage subcommands. Thin
-                          -- just wires args to the stage modules below.
+                          enqueue-trace / trace / coverage /
+                          setup-target-env / teardown-target-env /
+                          dynamic-probe / log-finding subcommands. Thin --
+                          just wires args to the stage modules below.
 
   stage0_index/
     parser.py             Pure function: java source text in, ParsedFile
@@ -160,12 +179,67 @@ pipeline/
                           trusted unfiltered), and updates
                           `trace_queue.status` to `done` or `blocked`.
 
+  stage4_5_dynamic_verify/
+    guard.py               `validate_local_target(url_or_host)` -- the one
+                          gate every other module in this package calls
+                          before firing any HTTP request or opening any DB
+                          connection. Mirrors `llm/ollama_client.py`'s
+                          `_validate_local_host()` exactly.
+    classify.py             Pure functions, no I/O: `classify_probe(...)`
+                          (the five-way `error`/`passthrough_unmodified`/
+                          `transformed`/`rejected`/`ambiguous` decision, in
+                          fixed priority order) and
+                          `order_hypothesis_for(target_variable)` (reuses
+                          Stage 3's `target_variable` linkage rather than
+                          re-deriving first/second-order itself).
+    candidates.py            `pending_candidates(conn)`: deterministic query
+                          over `trace_results (verdict='exploitable_path')`
+                          joined against `trace_queue`/`symbols`/
+                          `input_sources`, excluding already-batched pairs --
+                          Stage 4.5's equivalent of Stage 3's "select
+                          everything not yet enqueued" idempotency pattern.
+    env_setup.py             Automates the exact manual process validated in
+                          `tests/searching_for_strings_live_debug_writeup.md`:
+                          recompile decompiled source (`javac --release`,
+                          idempotent), stand up a disposable Postgres
+                          container and apply a human-supplied schema file,
+                          start the app with explicit `--server.port`/
+                          `--spring.datasource.*` overrides (see "Known
+                          boundaries" below for why those overrides are not
+                          optional), register/tear down `target_environments`
+                          rows. All Postgres access goes through `podman exec
+                          ... psql`/`pg_isready` via `subprocess`, matching
+                          the project's existing no-new-DB-driver convention.
+    probes.py                `FIXED_PROBE_SET` (`baseline`/`single_quote`/
+                          `double_quote`/`backslash` -- fixed and versioned,
+                          never chosen per-run), `fire_probe()` (guarded,
+                          uses `requests`), `run_battery()` (fires all four,
+                          captures everything the app logged since the probe
+                          was fired -- not a fixed-size tail, see "Known
+                          boundaries" -- and the resulting DB row via
+                          `podman exec ... psql`, then classifies and
+                          inserts).
+    interpret.py             `interpret_ambiguous(conn, runner, probe_row)`
+                          -- the only piece of this package that touches an
+                          LLM. Same defensive-parsing shape as
+                          `stage4_deep_trace/deep_trace.py`: on a parse
+                          failure, leaves `classification='ambiguous'` but
+                          still records `interpreted_by_run_id` for
+                          auditability.
+    orchestrator.py          `run_all_pending(conn, env_id,
+                          request_templates, runner=None)`: ties the above
+                          together for the `dynamic-probe` CLI command. Looks
+                          up each candidate's request shape in a
+                          human-supplied `request_templates` dict; a
+                          candidate with no matching entry is skipped and
+                          counted, never fabricated.
+
 prompts/
-  triage_v1.txt, audit_v1.txt, trace_v1.txt   Versioned system prompts.
-                          CLAUDE.md's rule: edit by incrementing the version
-                          suffix, never overwrite in place --
-                          llm_runs.prompt_version must always resolve to an
-                          exact historical prompt.
+  triage_v1.txt, audit_v1.txt, trace_v1.txt, dynamic_interpret_v1.txt
+                          Versioned system prompts. CLAUDE.md's rule: edit
+                          by incrementing the version suffix, never overwrite
+                          in place -- llm_runs.prompt_version must always
+                          resolve to an exact historical prompt.
 
 bench/context_benchmark.py    Standalone script, not part of the pipeline
                           proper. Needle-in-haystack test that empirically
@@ -193,6 +267,17 @@ tests/
                           links) and a RUN_LLM_TESTS=1 tier (full Stage 0-4
                           run, ~30+ min, asserting the three known
                           vulnerabilities trace as `exploitable_path`).
+  test_stage4_5_dynamic_verify.py    Same two-tier shape: a fast
+                          deterministic tier (guard/classify/candidates
+                          logic, schema CHECK enforcement, `interpret_ambiguous`
+                          against a stubbed runner) and a
+                          RUN_DYNAMIC_TESTS=1 tier (real recompile, real
+                          disposable Postgres container, real app process,
+                          asserting `signupPOST`'s `name` param reproduces
+                          the actual `PSQLException` on `single_quote`) --
+                          the same `RUN_LLM_TESTS=1` gating convention,
+                          renamed for what it actually gates here (a
+                          container + process, not necessarily an LLM call).
 ```
 
 ## The database is the integration contract
@@ -299,6 +384,52 @@ pipeline. `trace_queue.status` becomes `done`, or `blocked` if the verdict
 is `insufficient_context` (meaning the model itself reported it would need
 something outside what Stage 3 could assemble intra-file).
 
+## Stage 4.5, step by step
+
+Unlike every earlier stage, Stage 4.5 spans three separate CLI invocations
+because it involves standing up and tearing down real, stateful external
+processes rather than just reading/writing rows against a fixed input:
+
+1. **`setup-target-env`** -- `env_setup.recompile_source()` compiles the
+   decompiled source tree (idempotent: skipped if the target class already
+   exists in `build_dir`), `start_postgres_container()`/`wait_for_db_ready()`
+   stand up a disposable Postgres via `podman`, `apply_schema()` pipes a
+   **human-supplied** schema file into it (never generated -- see "Known
+   boundaries" below), `start_app()` launches the recompiled app with
+   explicit `--server.port`/`--spring.datasource.*` overrides (see "Known
+   boundaries" for why this was a real bug, not a design nicety), and
+   `register_environment()` writes one `target_environments` row. Prints
+   `env_id=<N>`.
+2. **`dynamic-probe --env-id <N> --request-templates <file>`** --
+   `orchestrator.run_all_pending()` calls `candidates.pending_candidates()`
+   (every `trace_results.verdict='exploitable_path'` row, plus any
+   second-order candidate implied by `trace_queue.target_variable`, not
+   already batched), looks up each candidate's endpoint/method/sibling
+   parameters in the human-supplied `request_templates` dict (skipping and
+   counting, never fabricating, a candidate with no entry), and for each one
+   calls `probes.create_batch()` + `probes.run_battery()`. `run_battery()`
+   fires all four `FIXED_PROBE_SET` probes in turn, each with its own
+   per-probe nonce (see "Known boundaries" for why per-battery reuse of a
+   sibling field like `username` broke three of every four probes the first
+   time this was tried), captures the app log written strictly since that
+   probe fired, looks up the resulting DB row via `podman exec ... psql`,
+   classifies via `classify.classify_probe()`, and inserts one
+   `dynamic_probe_results` row. Any `ambiguous` result is then, optionally,
+   resolved by `interpret.interpret_ambiguous()` through the local Ollama
+   `LLMRunner` -- the only model call in this entire stage.
+3. **`teardown-target-env --env-id <N>`** -- stops/removes the Postgres
+   container, sends `SIGTERM` to the app's recorded PID, and marks
+   `target_environments.status='stopped'`.
+
+Validated end to end against real BlueBird: a `signupPOST` battery on the
+`name` parameter produced `single_quote` -> `error` with the exact
+`BadSqlGrammarException`/`PSQLException: Unterminated string literal` text
+from the original manual live-debug session
+(`tests/searching_for_strings_live_debug_writeup.md`), and additionally
+showed `double_quote`/`backslash` -> `passthrough_unmodified` -- a genuine
+finding beyond what the manual session checked, confirming neither character
+is special to this sink in standard PostgreSQL string-literal syntax.
+
 ## Key design decisions (and why)
 
 **Hallucination detection via nullable `symbol_id`.** `triage_results` keeps
@@ -403,6 +534,39 @@ every method.
   triage run" logic yet, unlike `index`, which is fully incremental. On a
   large codebase this means re-running `triage` after a small source change
   currently costs the same as the first full run.
+- **Stage 4.5's request shape and DB schema are human-supplied, never
+  inferred.** Stage 0 captures whether a method is an entrypoint but not its
+  route path/HTTP method, nor a method's other required sibling parameters
+  (e.g. that `signupPOST` needs `username`/`email`/`password`/
+  `repeatPassword` alongside whichever field is being probed). Rather than
+  reopening Stage 0 to extract this, `request-templates.json` treats it as a
+  second human-supplied precondition, in the same spirit as the schema file
+  `apply_schema()` pipes in unmodified -- both are trusted input, never
+  reverse-engineered from decompiled source.
+- **`verify_table`/`verify_column` correctness is load-bearing and
+  unchecked.** If either is wrong (or a parameter's actual column name
+  differs from its request-param name and no `column_map` override is
+  given), `classify_probe()` will read "no matching row" and classify
+  `rejected` even when the value genuinely reached a sink -- there is no
+  independent check that these human-supplied fields are actually correct.
+- **A probe reaching a one-way transform can misclassify as `rejected`.**
+  Discovered directly during BlueBird validation, not anticipated in
+  design: probing `signupPOST`'s `password`/`repeatPassword` classified
+  every probe `rejected`, yet real rows *were* inserted each time with a
+  real BCrypt hash. A `LIKE '%nonce%'` lookup against a one-way hash can
+  never match regardless of whether the raw value was accepted, so
+  `classify_probe()` cannot currently distinguish "genuinely validated away"
+  from "reached a sink but is unrecoverable from the stored value." Anyone
+  writing a `request-templates.json` entry for a known hashed/encoded field
+  should treat a `rejected` classification there skeptically rather than at
+  face value -- this is a known, accepted gap in this pass, not a silently
+  smoothed-over one.
+- **Environment teardown is not automatic on a crashed run.** If a
+  `dynamic-probe` run itself crashes (as opposed to a probe simply
+  producing an `error` classification, which is the intended, handled
+  outcome), the container and app process from `setup-target-env` are left
+  running until `teardown-target-env` is run explicitly -- there is no
+  crash-handler or timeout that tears them down on the pipeline's behalf.
 
 ## Future direction: a real code-graph backend (Joern or similar) under Stage 0/3
 
@@ -482,3 +646,12 @@ command. Re-run `bench/context_benchmark.py` against the new model first
 threshold differs meaningfully; those constants must trace back to an actual
 benchmark run for the model in use, not be copied from WhiteRabbitNeo's
 numbers.
+
+**Adding a new Stage 4.5 probe**: add its name to `schema.sql`'s
+`dynamic_probe_results.probe_name` CHECK constraint (a full-table-rebuild
+migration on an existing DB -- SQLite can't ALTER a CHECK directly, see
+`DATA_DICTIONARY.md`), add it to `probes.FIXED_PROBE_SET` and
+`probes.probe_value()`, and update `classify.classify_probe()` if it implies
+a new evidence signal beyond the existing error/passthrough/transformed/
+rejected checks. Per `CLAUDE.md`, this is a deliberate, versioned code
+change -- never a per-run or LLM-chosen addition.

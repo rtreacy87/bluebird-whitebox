@@ -71,7 +71,7 @@ CREATE TABLE input_sources (
 
 CREATE TABLE llm_runs (
     run_id             INTEGER PRIMARY KEY,
-    stage              TEXT NOT NULL CHECK(stage IN ('triage','audit','trace')),
+    stage              TEXT NOT NULL CHECK(stage IN ('triage','audit','trace','dynamic_interpret')),
     model_name         TEXT NOT NULL,          -- exact Ollama tag, e.g. 'whiterabbitneo:latest'
     prompt_version     TEXT NOT NULL,          -- e.g. 'triage_v1'
     file_id            INTEGER REFERENCES files(file_id),
@@ -136,6 +136,87 @@ CREATE TABLE trace_results (
 );
 
 -- ============================================================
+-- STAGE 4.5: Dynamic verification (deterministic probe-firing
+-- against a verified-local disposable replica; LLM involvement,
+-- if any, is limited to interpreting an ambiguous probe result
+-- and always goes through llm_runs for provenance, same as
+-- every other LLM-derived table).
+-- ============================================================
+
+CREATE TABLE target_environments (
+    env_id             INTEGER PRIMARY KEY,
+    source_root        TEXT NOT NULL,              -- decompiled source root used
+                                                     -- (e.g. ~/BlueBirdSourceCode)
+    build_dir          TEXT NOT NULL,               -- recompiled classes output dir
+    start_class        TEXT NOT NULL,               -- Start-Class read from the jar's
+                                                     -- META-INF/MANIFEST.MF
+    app_host           TEXT NOT NULL DEFAULT 'localhost',
+    app_port           INTEGER NOT NULL,
+    app_pid            INTEGER,                     -- PID of the background java process,
+                                                     -- so teardown can find it across CLI calls
+    app_log_path       TEXT NOT NULL,               -- where the app's stdout/stderr was
+                                                     -- redirected, so probes.py can read
+                                                     -- exactly what it logged per request
+    db_container_name  TEXT,
+    db_host            TEXT NOT NULL DEFAULT 'localhost',
+    db_port            INTEGER,
+    db_user            TEXT,               -- needed by probes.py to query the
+                                            -- verify_table/verify_column row afterward
+    db_name            TEXT,
+    status             TEXT NOT NULL CHECK(status IN ('starting','running','stopped','failed'))
+                             DEFAULT 'starting',
+    started_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    stopped_at         TIMESTAMP
+);
+
+CREATE TABLE dynamic_probe_batches (
+    batch_id           INTEGER PRIMARY KEY,
+    source_trace_id    INTEGER NOT NULL REFERENCES trace_results(trace_id),
+                                                     -- the exploitable_path hypothesis
+                                                     -- this battery is verifying
+    input_source_id    INTEGER REFERENCES input_sources(source_id),
+                                                     -- NULL for a second-order candidate
+                                                     -- identified only via
+                                                     -- trace_queue.target_variable (no
+                                                     -- direct request param of its own)
+    target_param_name  TEXT NOT NULL,               -- the actual form/query param name fired
+    env_id             INTEGER NOT NULL REFERENCES target_environments(env_id),
+    endpoint           TEXT NOT NULL,                -- e.g. '/signup'
+    http_method        TEXT NOT NULL CHECK(http_method IN ('GET','POST')),
+    order_hypothesis   TEXT NOT NULL CHECK(order_hypothesis IN ('first_order','second_order')),
+    verify_table       TEXT,                          -- DB table to check for the probe's
+                                                        -- resulting row (human-supplied via
+                                                        -- request-templates.json)
+    verify_column      TEXT,                           -- DB column to check
+    started_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE dynamic_probe_results (
+    probe_id               INTEGER PRIMARY KEY,
+    batch_id               INTEGER NOT NULL REFERENCES dynamic_probe_batches(batch_id)
+                                 ON DELETE CASCADE,
+    probe_name             TEXT NOT NULL CHECK(probe_name IN ('baseline','single_quote',
+                                                                'double_quote','backslash')),
+    input_value            TEXT NOT NULL,             -- exact value sent for this probe
+    http_status            INTEGER,
+    response_snippet       TEXT,                       -- truncated response body
+    app_log_snippet        TEXT,                       -- tail of the target app's own console
+                                                        -- log around the time of the request
+    db_row_snippet         TEXT,                       -- verify_table/verify_column value found
+                                                        -- afterward, if any
+    classification         TEXT NOT NULL CHECK(classification IN ('error','passthrough_unmodified',
+                                                                    'transformed','rejected','ambiguous'))
+                                 DEFAULT 'ambiguous',
+    interpreted_by_run_id  INTEGER REFERENCES llm_runs(run_id),
+                                                        -- set only when an ambiguous result was
+                                                        -- resolved by the local-LLM interpretation
+                                                        -- pass (interpret.py) -- never set for the
+                                                        -- other four deterministic classifications
+    notes                  TEXT,
+    created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
 -- STAGE 5-6: Human verification + final findings
 -- Only findings with verified_by_human=1 AND status='confirmed'
 -- should ever leave the DB in an exported report.
@@ -196,3 +277,9 @@ CREATE INDEX idx_findings_status        ON findings(status, verified_by_human);
 -- Input source lookup (entry points into the codebase).
 CREATE INDEX idx_input_sources_symbol   ON input_sources(symbol_id);
 CREATE INDEX idx_symbols_entrypoint     ON symbols(is_entrypoint);
+
+-- Dynamic verification lookups (Stage 4.5).
+CREATE INDEX idx_dynamic_batches_trace_id  ON dynamic_probe_batches(source_trace_id);
+CREATE INDEX idx_dynamic_batches_env_id    ON dynamic_probe_batches(env_id);
+CREATE INDEX idx_dynamic_results_batch_id  ON dynamic_probe_results(batch_id);
+CREATE INDEX idx_dynamic_results_class     ON dynamic_probe_results(classification);

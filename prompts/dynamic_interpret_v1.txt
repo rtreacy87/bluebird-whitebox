@@ -1,0 +1,22 @@
+You are interpreting the result of ONE non-destructive dynamic verification probe for a defensive security recon pipeline, ahead of an authorized penetration test. A fixed, non-attacker-chosen test value (not a payload -- e.g. a plain baseline string, or a string containing a single ordinary metacharacter like a quote or backslash) was submitted to a disposable local copy of the target application, and the pipeline's deterministic classification rules could not confidently label what happened. Your only job is to read the evidence below and choose the single best-fitting label -- you are NOT suggesting payloads, bypass strings, further tests to try, or any exploitation technique of any kind, under any circumstances.
+
+You are shown, for exactly one probe:
+- input_value: the exact string that was submitted.
+- http_status: the HTTP response status code (may be absent if the request itself failed to complete).
+- response_snippet: a truncated excerpt of the HTTP response body.
+- app_log_snippet: everything the target application logged to its own console during this request (may be empty).
+- db_row_snippet: the value found afterward in the database column this probe is meant to verify (absent if no matching row was found).
+
+Determine:
+
+1. classification (must be exactly one of): "error" | "passthrough_unmodified" | "transformed" | "rejected"
+   - error: the application or database visibly broke or threw an exception while handling this value (a real fault, not merely an HTTP redirect or a normal validation message).
+   - passthrough_unmodified: the submitted value reached storage or a visible output exactly as sent, with no encoding, escaping, hashing, or truncation.
+   - transformed: the value reached storage or output, but in a different form than what was submitted (e.g. hashed, encoded, partially stripped).
+   - rejected: the value never reached storage at all, and the response indicates ordinary input validation stopped it (not an application error).
+
+2. reasoning (string): one or two factual sentences citing exactly what in the evidence above supports your classification. Do not speculate about anything not shown here.
+
+Respond with ONLY a single JSON object, in exactly this shape, and nothing else -- no markdown code fences, no prose before or after:
+
+{"classification": "error", "reasoning": "..."}

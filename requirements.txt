@@ -1,3 +1,4 @@
 javalang==0.13.0
 ollama==0.4.7
 pytest==8.3.4
+requests==2.34.2

@@ -7,15 +7,23 @@ Usage:
     python -m pipeline.cli enqueue-trace --db data/recon.db
     python -m pipeline.cli trace         --source <dir> --db data/recon.db [--model NAME]
     python -m pipeline.cli log-finding   --db data/recon.db --verification-method live_debug --status confirmed ...
+    python -m pipeline.cli setup-target-env    --source <dir> --schema-sql <file> --db-user U --db-password P --db-name N --db data/recon.db
+    python -m pipeline.cli dynamic-probe       --env-id <N> --request-templates <file> --db data/recon.db
+    python -m pipeline.cli teardown-target-env --env-id <N> --db data/recon.db
     python -m pipeline.cli coverage      --db data/recon.db
 
 Stage 6 (findings report export) is deliberately not implemented yet per
 CLAUDE.md's build order. `log-finding` is Stage 5's write-side only -- a
 human records what they already verified; nothing here decides anything.
+`setup-target-env`/`dynamic-probe`/`teardown-target-env` are Stage 4.5
+(dynamic verification) -- see CLAUDE.md's "Dynamic Verification (Stage 4.5)"
+section for the hard local-only guardrail and probe-set scope boundary.
 """
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from pipeline import config, db
 from pipeline.llm.ollama_client import LLMRunner, ModelNotAvailableError, OllamaClient
@@ -24,6 +32,7 @@ from pipeline.stage1_triage.triage import triage_all_files
 from pipeline.stage2_audit.audit import audit_all_files
 from pipeline.stage3_trace.builder import enqueue_trace_targets
 from pipeline.stage4_deep_trace.deep_trace import trace_all_pending
+from pipeline.stage4_5_dynamic_verify import env_setup, orchestrator
 from pipeline.stage5_verify.logger import InvalidFindingError, log_finding
 
 DEFAULT_MODEL = "whiterabbitneo-33b:latest"
@@ -99,6 +108,60 @@ def cmd_log_finding(args):
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
     print(f"logged finding_id={finding_id}")
+
+
+def cmd_setup_target_env(args):
+    conn = db.connect(args.db)
+    build_dir = args.build_dir or str(Path(args.source).parent / f"{Path(args.source).name}-build")
+
+    build = env_setup.recompile_source(args.source, build_dir, release=args.java_release)
+    if not build.compiled_ok:
+        print(f"error: recompile failed:\n{build.stderr_tail}", file=sys.stderr)
+        sys.exit(1)
+
+    env_setup.start_postgres_container(
+        args.db_container_name, args.db_user, args.db_password, args.db_name,
+        port=args.db_port, image=args.db_image,
+    )
+    env_setup.wait_for_db_ready(args.db_container_name, args.db_user, args.db_name)
+    env_setup.apply_schema(args.db_container_name, args.db_user, args.db_name, args.schema_sql)
+
+    started = env_setup.start_app(
+        build.build_dir, args.source, build.start_class, app_port=args.app_port,
+        db_host="localhost", db_port=args.db_port, db_name=args.db_name,
+        db_user=args.db_user, db_password=args.db_password,
+    )
+    env_setup.wait_for_app_ready("localhost", args.app_port)
+
+    env_id = env_setup.register_environment(
+        conn, source_root=args.source, build_dir=build.build_dir, start_class=build.start_class,
+        app_host="localhost", app_port=args.app_port, app_pid=started["pid"],
+        app_log_path=started["log_path"], db_container_name=args.db_container_name,
+        db_host="localhost", db_port=args.db_port, db_user=args.db_user, db_name=args.db_name,
+    )
+    print(f"env_id={env_id}")
+
+
+def cmd_teardown_target_env(args):
+    conn = db.connect(args.db)
+    env_setup.teardown_environment(conn, args.env_id)
+    print(f"env_id={args.env_id} torn down")
+
+
+def cmd_dynamic_probe(args):
+    conn = db.connect(args.db)
+    request_templates = json.loads(Path(args.request_templates).read_text())
+    runner = None
+    if not args.no_llm_interpret:
+        client = OllamaClient(model_name=args.model, num_ctx=args.num_ctx, host=args.host)
+        try:
+            client.verify_model_available()
+        except ModelNotAvailableError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        runner = LLMRunner(conn, client)
+    stats = orchestrator.run_all_pending(conn, args.env_id, request_templates, runner=runner)
+    print(stats)
 
 
 def cmd_coverage(args):
@@ -199,6 +262,48 @@ def build_parser():
         help="record this WITHOUT marking verified_by_human=1 (rare -- this command exists specifically to record verification, so verified_by_human defaults to true)",
     )
     p_log_finding.set_defaults(func=cmd_log_finding)
+
+    p_setup_env = sub.add_parser(
+        "setup-target-env",
+        help="Stage 4.5: recompile decompiled source + stand up a disposable local DB + start the target app",
+    )
+    p_setup_env.add_argument("--source", required=True, help="decompiled source root (e.g. ~/BlueBirdSourceCode)")
+    p_setup_env.add_argument("--build-dir", default=None, help="default: <source>-build alongside --source")
+    p_setup_env.add_argument("--schema-sql", required=True, help="human-authored minimal DB schema for the target")
+    p_setup_env.add_argument("--db-container-name", default="wb-dynamic-pg")
+    p_setup_env.add_argument("--db-image", default="docker.io/library/postgres:15")
+    p_setup_env.add_argument("--db-user", required=True)
+    p_setup_env.add_argument("--db-password", required=True)
+    p_setup_env.add_argument("--db-name", required=True)
+    p_setup_env.add_argument("--db-port", type=int, default=5432)
+    p_setup_env.add_argument("--app-port", type=int, default=8080)
+    p_setup_env.add_argument("--java-release", default="17")
+    p_setup_env.add_argument("--db", default="data/recon.db")
+    p_setup_env.set_defaults(func=cmd_setup_target_env)
+
+    p_teardown_env = sub.add_parser("teardown-target-env", help="stop+remove a Stage 4.5 disposable environment")
+    p_teardown_env.add_argument("--env-id", type=int, required=True)
+    p_teardown_env.add_argument("--db", default="data/recon.db")
+    p_teardown_env.set_defaults(func=cmd_teardown_target_env)
+
+    p_dynamic_probe = sub.add_parser(
+        "dynamic-probe",
+        help="Stage 4.5: fire the fixed non-destructive probe battery at each exploitable_path candidate",
+    )
+    p_dynamic_probe.add_argument("--db", default="data/recon.db")
+    p_dynamic_probe.add_argument("--env-id", type=int, required=True)
+    p_dynamic_probe.add_argument(
+        "--request-templates", required=True,
+        help="JSON file: symbol_name -> {endpoint, http_method, param_defaults, verify_table, column_map?}",
+    )
+    p_dynamic_probe.add_argument("--model", default=DEFAULT_MODEL, help="local model, used only to interpret ambiguous results")
+    p_dynamic_probe.add_argument("--host", default="http://localhost:11434")
+    p_dynamic_probe.add_argument("--num-ctx", dest="num_ctx", type=int, default=config.DEFAULT_NUM_CTX)
+    p_dynamic_probe.add_argument(
+        "--no-llm-interpret", action="store_true",
+        help="skip local-LLM interpretation; leave ambiguous results as 'ambiguous' for manual review",
+    )
+    p_dynamic_probe.set_defaults(func=cmd_dynamic_probe)
 
     p_coverage = sub.add_parser("coverage", help="print Stage 0 -> Stage 1 coverage as a query, not a stored field")
     p_coverage.add_argument("--db", default="data/recon.db")

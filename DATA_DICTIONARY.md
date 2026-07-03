@@ -200,6 +200,7 @@ produced it, which matters once a file is split across multiple LLM calls.
 - `triage` — Stage 1, first-pass per-file review.
 - `audit` — Stage 2, adversarial check of a triage run against Stage 0 ground truth.
 - `trace` — Stage 4, deep-trace of a specific queued item.
+- `dynamic_interpret` — Stage 4.5, the one place in that stage that touches a model at all: interpreting an ambiguous dynamic-probe result. The raw probe-firing and classification rules are pure deterministic Python and never appear here.
 
 ### `triage_results`
 
@@ -398,6 +399,183 @@ regardless of what `trace_results.verdict` says.
 - `safe_path` — a path was traced but is not exploitable (e.g. properly sanitized/parameterized).
 - `insufficient_context` — the assembled context wasn't enough to reach a verdict.
 - `inconclusive` — the model could not determine a verdict for another reason.
+
+## Stage 4.5 — Dynamic verification (deterministic probe-firing; local-LLM interpretation only for ambiguous results)
+
+Turns a Stage 4 `exploitable_path` hypothesis into observed evidence: stands
+up a disposable local replica of the target, fires a small fixed
+non-destructive probe battery at each flagged variable, and records exactly
+what happened. Never itself a `findings` row — this is evidence for Stage
+5's human to review, and the prioritized candidate list a separate,
+human-directed tool (e.g. `sqlmap`) gets handed next.
+
+### `target_environments`
+
+One row per disposable local replica Stage 4.5 stood up (or was pointed at
+across CLI calls).
+
+**Why:** `pipeline/stage4_5_dynamic_verify/env_setup.py` automates a real,
+multi-step manual process (recompile decompiled source, stand up a
+container, start the app) validated by hand in
+`tests/searching_for_strings_live_debug_writeup.md` — this table is the
+audit trail of exactly which source root, build, and running process a
+given probe battery ran against, so a `dynamic_probe_results` row can always
+be traced back to precisely what was tested, not just "some local copy at
+some point." `app_pid` and `db_container_name` exist specifically so
+`teardown_environment()` can find and stop the right process/container
+later, across separate CLI invocations (the Python process that started
+them has long since exited by teardown time). `app_log_path` is recorded
+here — not derived on the fly — because `probes.py` needs to know exactly
+which file to read from to capture what the app logged during a specific
+request; guessing this from `build_dir` was tried first, but that's the
+mechanism, not the actual value in the row (the same reasoning that led
+`llm_runs` to store a real reported token count rather than re-deriving an
+estimate).
+
+**Why `db_user`/`db_name` are separate columns from `db_container_name`**:
+found necessary during implementation, not designed upfront —
+`probes.py`'s verify-row lookup (`podman exec <container> psql -U <user> -d
+<name> ...`) needs the actual credentials/database name, not just which
+container to exec into.
+
+| Column | Type | Description |
+|---|---|---|
+| `env_id` | INTEGER (PK) | Unique identifier for this environment. |
+| `source_root` | TEXT | Decompiled source root used (e.g. `~/BlueBirdSourceCode`). |
+| `build_dir` | TEXT | Where the recompiled `.class` files were written. |
+| `start_class` | TEXT | The app's actual entry-point class, read from the jar's `META-INF/MANIFEST.MF` — needed because the decompiled jar's own bootstrap loader is unusable (see "Why" below the table in `env_setup.py`'s module docstring, and `tests/searching_for_strings_live_debug_writeup.md` Step 4). |
+| `app_host` | TEXT | Where the app is reachable. Always a verified-local hostname — see `guard.py`. |
+| `app_port` | INTEGER | Port the app was told to bind via a `--server.port` override (see "Why" below). |
+| `app_pid` | INTEGER | PID of the background `java` process, so teardown can find it later. |
+| `app_log_path` | TEXT | Where the app's stdout/stderr was redirected. |
+| `db_container_name` | TEXT | The disposable Postgres container's name. |
+| `db_host` / `db_port` | TEXT / INTEGER | Where that container is reachable. |
+| `db_user` / `db_name` | TEXT | Credentials/database `probes.py` needs to query the verify row afterward. |
+| `status` | TEXT | Lifecycle state. See factors below. |
+| `started_at` / `stopped_at` | TIMESTAMP | When this environment came up / was torn down. |
+
+**`status` factors:**
+- `starting` — environment setup in progress.
+- `running` — app and DB both confirmed reachable.
+- `stopped` — torn down via `teardown_environment()`.
+- `failed` — setup didn't complete.
+
+**Why `app_port`/the datasource connection are passed as explicit
+overrides, not left to the target's own defaults:** discovered directly
+during implementation, not anticipated in the design. `start_app()`
+originally just launched the target's classpath with no port or datasource
+argument, trusting whatever was hardcoded in the target's own
+`application.properties`. The first real test crashed immediately —
+`Port 8080 was already in use` — because the target's own default port
+collided with an unrelated, already-running instance. Worse, had the ports
+not collided, the app would have silently connected to *whichever*
+Postgres instance happened to be listening on the hardcoded default port —
+possibly the wrong disposable replica entirely, defeating Stage 4.5's whole
+guarantee of knowing precisely what a probe battery ran against. Fixed by
+passing `--server.port=<app_port>` and
+`--spring.datasource.url=jdbc:postgresql://<db_host>:<db_port>/<db_name>`
+(plus credentials) as Spring Boot property-override program arguments —
+verified for real afterward: a probe-battery signup landed in exactly the
+intended container and not a second, coincidentally-identical one running
+alongside it.
+
+### `dynamic_probe_batches`
+
+One row per (flagged hypothesis, candidate variable) pair queued for
+probing — the unit `dynamic-probe` schedules and skips if already run.
+
+**Why:** Mirrors `trace_queue`'s "scripted work assignment, not an LLM
+decision" role one stage later. `source_trace_id` is `NOT NULL` (every
+battery must trace back to a real Stage 4 `exploitable_path` row);
+`input_source_id` is nullable specifically for second-order candidates that
+have no direct `input_sources` row of their own (e.g. `profile`'s `email`,
+which is Stage 3's `trace_queue.target_variable` linkage, not a request
+parameter `profile` itself declares). `verify_table`/`verify_column` are
+human-supplied (via `request-templates.json`), the same trust level as
+`env_setup.apply_schema`'s schema file — Stage 4.5 does not infer either
+from decompiled source (see `CLAUDE.md`'s Stage 4.5 section).
+
+| Column | Type | Description |
+|---|---|---|
+| `batch_id` | INTEGER (PK) | Unique identifier for this batch. |
+| `source_trace_id` | INTEGER (FK → `trace_results`) | The `exploitable_path` hypothesis this battery verifies. |
+| `input_source_id` | INTEGER (FK → `input_sources`, nullable) | The request-param row being probed, if this is a direct (first-order) candidate. |
+| `target_param_name` | TEXT | The actual form/query parameter name fired. |
+| `env_id` | INTEGER (FK → `target_environments`) | Which disposable replica this battery ran against. |
+| `endpoint` / `http_method` | TEXT | Where and how the request is sent. |
+| `order_hypothesis` | TEXT | See factors below. |
+| `verify_table` / `verify_column` | TEXT | Where to look afterward for the probe's resulting row. |
+| `started_at` | TIMESTAMP | When this battery was created. |
+
+**`order_hypothesis` factors:**
+- `first_order` — the flagged value comes straight from this method's own request parameters (`trace_queue.target_variable` was `NULL`).
+- `second_order` — the flagged value is a stored value read back unsafely elsewhere (`trace_queue.target_variable` was set — reuses Stage 3's already-established linkage rather than re-deriving it).
+
+### `dynamic_probe_results`
+
+One row per individual probe fired within a battery — the actual recorded
+evidence: what was tested, what came back.
+
+**Why the fixed four-probe set:** `baseline` (a plain control value, to
+confirm normal behavior), `single_quote`, `double_quote`, `backslash` — a
+small, versioned, non-attacker-chosen set (see `CLAUDE.md`'s "the probe set
+is fixed and versioned, never LLM-chosen"). Real results against
+`AuthController.signupPOST`'s `name` parameter: `single_quote` reproduced
+the exact `BadSqlGrammarException`/`PSQLException` from
+`tests/searching_for_strings_live_debug_writeup.md`'s manual test, while
+`double_quote` and `backslash` both classified `passthrough_unmodified` —
+correct, not a miss: neither character is special in standard PostgreSQL
+string-literal syntax, so this genuinely tells you *which specific
+character* matters for this sink, not just "something breaks it."
+
+**Why `classification` checks `error` before `passthrough_unmodified`:** a
+request that 500s with a matching exception in the app's own log is a
+stronger, more specific signal that the value broke the query than merely
+finding the raw value in a row that may not even have been written by this
+probe — see `classify.classify_probe()`'s documented priority order.
+
+**A real, discovered limitation, not a hypothetical:** probing
+`signupPOST`'s `password`/`repeatPassword` against real BlueBird classified
+every probe `rejected` — but real rows *were* inserted each time, with a
+real BCrypt hash in the `password` column. `rejected` is the wrong read
+here: the value did reach a sink, it just went through a one-way transform
+first, so a `LIKE '%nonce%'` lookup against the stored hash can never match
+regardless of what was actually accepted. Deterministic classification
+cannot currently distinguish "genuinely validated away before any sink"
+from "reached a sink but was transformed by a one-way function this method
+of verification can't see through" — both look identical from here (no
+matching row, a clean response, no error). This is a known, accepted gap in
+this pass, not a silent one: anyone authoring a `request-templates.json`
+`verify_column` for a field known to be hashed/encoded one-way should read
+a `rejected` classification skeptically rather than trust it at face value.
+
+| Column | Type | Description |
+|---|---|---|
+| `probe_id` | INTEGER (PK) | Unique identifier for this probe result. |
+| `batch_id` | INTEGER (FK → `dynamic_probe_batches`) | Battery this probe belongs to. Cascades on delete. |
+| `probe_name` | TEXT | Which of the fixed four probes this is. See factors below. |
+| `input_value` | TEXT | The exact value sent for this probe. |
+| `http_status` | INTEGER | Observed HTTP response status. |
+| `response_snippet` | TEXT | Truncated response body. |
+| `app_log_snippet` | TEXT | Everything the target logged during this specific request — captured by recording the log's line count immediately before firing and reading everything written after, *not* a fixed-size tail (a fixed 50-line tail was tried first and found to truncate real evidence: a single Spring Security stack trace routinely runs 60-100+ lines, easily pushing the actual exception summary line out of a short fixed window). |
+| `db_row_snippet` | TEXT | The `verify_table`/`verify_column` value found afterward, if any. |
+| `classification` | TEXT | The deterministic (or local-LLM-assisted) read of what happened. See factors below. |
+| `interpreted_by_run_id` | INTEGER (FK → `llm_runs`, nullable) | Set only when an `ambiguous` result went through the local-LLM interpretation pass — never set for the four deterministic classifications. |
+| `notes` | TEXT | Free-text notes (e.g. the interpreting model's reasoning, or a parse-failure message). |
+| `created_at` | TIMESTAMP | When this probe ran. |
+
+**`probe_name` factors:**
+- `baseline` — a plain alphanumeric control value.
+- `single_quote` — the value includes a literal `'`.
+- `double_quote` — the value includes a literal `"`.
+- `backslash` — the value includes a literal `\`.
+
+**`classification` factors:**
+- `error` — the application or database visibly broke handling this value.
+- `passthrough_unmodified` — the value reached storage/output exactly as sent.
+- `transformed` — the value reached storage/output, but in a different form.
+- `rejected` — the value never reached storage, and nothing indicates an application fault (see the `password` limitation above for when this reading is unreliable).
+- `ambiguous` — the deterministic rules couldn't confidently pick one of the above; resolved (or left as-is on a parse failure) by the local-LLM interpretation pass.
 
 ## Stage 5-6 — Human verification + final findings
 

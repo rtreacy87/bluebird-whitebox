@@ -28,6 +28,9 @@ Stage 1: Triage Pass       (LLM, per-file)           -> triage_results
 Stage 2: Audit Pass        (LLM, adversarial)        -> audit_results
 Stage 3: Trace Worklist    (deterministic queue)     -> trace_queue
 Stage 4: Deep-Trace Pass   (LLM, per-item)           -> trace_results
+Stage 4.5: Dynamic Verification Probe (deterministic firing,
+           local-only, non-destructive, LLM only for
+           ambiguous-result interpretation)          -> dynamic_probe_results
 Stage 5: Human Verification Gate                     -> findings.verified_by_human
 Stage 6: Findings Store                              -> findings (report source of truth)
 ```
@@ -56,8 +59,16 @@ a highly agentic model; do not refactor toward an autonomous agent loop.
    resolution be considered. This is a deliberate, measured decision based on
    observed gaps in `resolved = 0` edges — not a default next step. Do not silently
    start building it.
-5. Human verification gate and findings export are last — they depend on everything
-   upstream being stable.
+5. **Stage 4.5 (dynamic verification)**, built only after Stage 1-4 are validated
+   against BlueBird (the three known vulnerabilities must already surface as
+   `exploitable_path` `trace_results` rows). Validate the environment-automation and
+   probe-firing mechanics against a disposable local BlueBird replica (recompiled
+   from `~/BlueBirdSourceCode` per `tests/searching_for_strings_live_debug_writeup.md`)
+   before trusting this stage against Pass2 or a real engagement target — do not
+   assume the recompile/container/probe mechanics generalize to a new target for
+   free, the same caution already applied to cross-file resolution above.
+6. Human verification gate and findings export are last — they depend on
+   everything upstream (now including wherever Stage 4.5 was run) being stable.
 
 ## Database
 
@@ -156,6 +167,82 @@ Prompt requirements (do not weaken these when editing):
 - Log `chunk_index` / `chunk_total` on every `llm_runs` row so any result is
   traceable back to exactly which slice of the file produced it.
 
+## Dynamic Verification (Stage 4.5)
+
+Stage 4.5 turns a Stage 4 `exploitable_path` hypothesis into evidence: it
+stands up a disposable local copy of the target, fires a small, fixed,
+non-destructive battery of "interpretation probes" at each flagged
+candidate variable, and records exactly what happened. It exists to produce
+a prioritized, evidence-backed candidate list for a human to hand to a
+separate, human-directed tool (e.g. `sqlmap`) — not to redo that tool's job
+itself.
+
+**Hard local-only guardrail.** Every code path that fires an HTTP request or
+opens a database connection for Stage 4.5 must call
+`pipeline/stage4_5_dynamic_verify/guard.py`'s `validate_local_target()`
+before doing anything else — the same enforcement pattern as
+`pipeline/llm/ollama_client.py`'s `_validate_local_host()`. This pipeline
+never fires a probe, of any kind, at a hostname outside
+`{"localhost", "127.0.0.1", "::1"}`. Treat any code path that would reach a
+non-local target as a bug, exactly as this document already treats a
+non-local Ollama call.
+
+**The probe set is fixed and versioned, never LLM-chosen.** Consistent with
+"the LLM never decides what to look at next" above: Stage 4.5 always fires
+the same four probes per candidate variable — `baseline`, `single_quote`,
+`double_quote`, `backslash` — defined once in
+`pipeline/stage4_5_dynamic_verify/probes.py`. If the probe set itself needs
+to change, that's a deliberate, versioned code change, never a per-run
+model decision.
+
+**In scope:** firing the fixed probe set at a single candidate request
+parameter (one battery per `trace_results`/candidate-variable pair);
+observing HTTP status, response body, the target's own app log, and the
+resulting database row; deterministic classification (`error`,
+`passthrough_unmodified`, `transformed`, `rejected`, with `ambiguous`
+resolved via the existing local Ollama `LLMRunner` — never a hosted model,
+never the raw probe-firing path itself); deterministic first-order/
+second-order tagging reusing Stage 3's `trace_queue.target_variable` linkage.
+
+**Explicitly out of scope (this is not sqlmap, and isn't trying to be):**
+no UNION-based extraction, no boolean-blind or time-blind oracles, no
+stacked queries, no authentication bypass, no payload/bypass-string
+generation of any kind. Stage 4.5 answers "does an ordinary metacharacter
+survive unescaped to the sink" — not "can I extract data" or "can I bypass
+a filter."
+
+**Standing up a local replica is scoped to BlueBird first, like everything
+else here.** `pipeline/stage4_5_dynamic_verify/env_setup.py` automates the
+exact manual process validated in
+`tests/searching_for_strings_live_debug_writeup.md` (recompile the
+decompiled source with `javac --release <N> -g -parameters`, read
+`Start-Class` from the jar's manifest, run the app directly via classpath, a
+disposable rootless Podman Postgres container for the DB). This automates
+*re-running* against a target already worked out this way once — it does
+not solve, for an arbitrary new target, either of two problems a human must
+still handle: (1) producing a minimal DB schema (there is no
+`schema.sql`-equivalent shipped with decompiled source — a human reads the
+target's own `SELECT`/`INSERT` statements, exactly as was done for
+BlueBird's `users` table), or (2) knowing the request shape a given
+endpoint needs (its route, HTTP method, and the other same-request
+parameters a candidate variable's sibling fields require, e.g. `signupPOST`
+needing `username`/`email`/`password`/`repeatPassword` alongside whichever
+parameter is being probed). Both are supplied by a human as explicit input
+(a schema file, a request-template JSON file) — Stage 4.5 does not infer
+either from decompiled source. Treat this the same way cross-file
+resolution is treated: validate against BlueBird first, do not assume it
+generalizes to an arbitrary new target for free.
+
+**Why the interpretation pass, specifically, must be local-model-only.** Any
+code path (in Stage 4.5's `interpret.py`) that has to make an interpretive
+judgment call on an ambiguous probe result must go through the existing
+`LLMRunner`/Ollama path — the same "nothing in this pipeline should call an
+external/hosted API" rule this document already states, applied to Stage
+4.5's one judgment-requiring step. The raw HTTP request/response mechanics
+and the deterministic classification rules need no model at all — this
+mirrors Stage 3's deterministic graph walk vs. Stage 4's LLM judgment split
+above.
+
 ## Testing
 
 - **`~/BlueBirdSourceCode`** — primary regression corpus. This is the decompiled
@@ -185,6 +272,14 @@ Prompt requirements (do not weaken these when editing):
 - Structural completeness (Layer A audit) must be checked with a deterministic
   parser-based method count compared against triage row count — implement this as
   an actual test assertion, not a manual read of output.
+- Stage 4.5 (dynamic verification) must be validated against a disposable,
+  locally-running copy of BlueBird — reusing
+  `tests/searching_for_strings_live_debug_writeup.md`'s manual process, now
+  automated by `pipeline/stage4_5_dynamic_verify/env_setup.py` — before
+  being trusted against Pass2 or a real engagement target. Gate any test
+  that actually fires a probe or stands up a container behind
+  `RUN_DYNAMIC_TESTS=1`, the same pattern `RUN_LLM_TESTS=1` already
+  establishes for tests that need a real Ollama call.
 
 ## What NOT to build here
 
@@ -192,10 +287,19 @@ Prompt requirements (do not weaken these when editing):
   sub-tasks dynamically. Orchestration is deterministic and lives in Python, not
   in a prompt.
 - No calls to hosted/external LLM APIs anywhere in this codebase.
-- No payload generation, bypass-string generation, or automated request-firing
-  against a target application. This tool stops at "here is a mapped, cited
-  hypothesis" — exploitation and verification are manual, human-led steps outside
-  this codebase.
+- No payload generation, bypass-string generation, or automated exploitation
+  technique — no UNION-based extraction, no boolean/time-blind oracles, no
+  stacked queries, no auth bypass — against any target, local or otherwise.
+  The one narrow exception is Stage 4.5's fixed, versioned probe battery
+  (baseline / single-quote / double-quote / backslash), which only ever fires
+  against a verified-local disposable replica the pipeline itself stood up
+  (see "Dynamic Verification (Stage 4.5)" above) and exists purely to turn a
+  static hypothesis into an evidence-backed, prioritized candidate list for a
+  human to hand to a separate, human-directed tool (e.g. sqlmap) — it does
+  not itself perform exploitation, and it never resembles an actual
+  injection technique. Outside that one exception, this tool stops at "here
+  is a mapped, cited hypothesis" — exploitation and verification remain
+  manual, human-led steps outside this codebase.
 - No silent fallback that treats an unresolved cross-file call as "no issue" —
   unresolved must always remain a visible, queryable state (`resolved = 0`), never
   collapsed into a clean result.

@@ -189,6 +189,73 @@ enqueued). On a large codebase, expect the LLM-bound stages to take a
 while -- larger, CPU/GPU-shared models can take single-digit minutes per
 call.
 
+### Stage 4.5: dynamic verification
+
+Once Stage 4 has produced `exploitable_path` hypotheses, Stage 4.5 turns them
+into observed evidence by firing a small, fixed, non-destructive probe
+battery at a disposable local replica of the target -- see `CLAUDE.md`'s
+"Dynamic Verification (Stage 4.5)" section for the exact scope boundary
+(this is deliberately *not* a sqlmap replacement, see "When it's not"
+below). Three commands, always against a **local** target only
+(`pipeline/stage4_5_dynamic_verify/guard.py` enforces this):
+
+```bash
+# Stand up a disposable local replica: recompile the decompiled source,
+# start a throwaway Postgres container, apply your own schema file, boot
+# the app pointed at that container. Prints env_id=<N>.
+.venv/bin/python -m pipeline.cli setup-target-env \
+    --source ~/BlueBirdSourceCode/BOOT-INF/classes \
+    --schema-sql ~/BlueBirdSourceCode/schema.sql \
+    --db-user bluebird --db-password bluebird --db-name bluebird \
+    --db data/recon.db
+
+# Fire the fixed probe battery (baseline / single_quote / double_quote /
+# backslash) at every pending exploitable_path candidate that has a request
+# template, classify each result, and optionally resolve ambiguous ones via
+# the local model.
+.venv/bin/python -m pipeline.cli dynamic-probe \
+    --env-id 1 \
+    --request-templates request-templates.json \
+    --model whiterabbitneo-33b:latest \
+    --db data/recon.db
+
+# Tear it down when done -- not automatic on a crash, so run this
+# explicitly even after an interrupted run.
+.venv/bin/python -m pipeline.cli teardown-target-env --env-id 1 --db data/recon.db
+```
+
+`--request-templates` is a human-supplied JSON file describing each
+endpoint's request shape -- Stage 0 has no route/HTTP-method or
+sibling-parameter information to infer this from, so it's trusted input,
+the same trust level as the schema file passed to `--schema-sql`:
+
+```json
+{
+  "signupPOST": {
+    "endpoint": "/signup",
+    "http_method": "POST",
+    "param_defaults": {
+      "name": "Probe User",
+      "username": "probeuser_{nonce}",
+      "email": "probe_{nonce}@test.com",
+      "password": "ProbePass123",
+      "repeatPassword": "ProbePass123"
+    },
+    "verify_table": "users"
+  }
+}
+```
+
+`{nonce}` in a sibling parameter's default marks it as needing a fresh
+per-probe value (e.g. `username`, which must be unique per signup attempt) --
+see `ARCHITECTURE.md`'s "Known boundaries" for why reusing the same sibling
+value across all four probes in a battery silently broke three of them the
+first time this was tried. Results land in `dynamic_probe_results`
+(`classification`: `error`/`passthrough_unmodified`/`transformed`/
+`rejected`/`ambiguous`) -- this is the prioritized, evidence-backed candidate
+list you hand to a separate, human-directed tool like `sqlmap` next, not a
+`findings` row on its own.
+
 Once you've picked a finding worth manually verifying (e.g. via a live
 debugger -- see "Verifying and logging a finding" below), record the
 result:
@@ -393,6 +460,14 @@ already done and a breakpoint has already told you something concrete.
 - **Automated exploitation or payload generation.** Out of scope by design
   (see `CLAUDE.md`); if you need working proof-of-concept payloads, that's a
   manual step after a finding is verified.
+- **A substitute for `sqlmap` (or similar).** Stage 4.5's probe battery is
+  deliberately narrow -- four fixed, non-destructive metacharacter probes
+  against a local replica, to confirm a hypothesis and prioritize a
+  candidate list. It never attempts UNION-based extraction, blind/time-based
+  oracles, stacked queries, or auth bypass. Once Stage 4.5 tells you *which*
+  parameter is worth pursuing and roughly how the sink reacts, actual
+  exploitation-technique automation against the real target is still a
+  separate, human-directed step outside this codebase.
 - **Unauthorized testing.** This is a defensive-assessment recon aid for
   engagements you're authorized to perform, not a scanning tool to point at
   arbitrary targets.

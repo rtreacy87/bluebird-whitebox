@@ -386,6 +386,108 @@ for the underlying technique). `ARCHITECTURE.md`'s "Known boundaries"
 section is the terse, reference-style version of everything in this
 subsection.
 
+### Running Stage 4.5: turning the `signupPOST` hypothesis into observed evidence
+
+Before reaching for VS Code, there's a faster, fully-recorded way to get
+real signal on the `signupPOST` hypothesis above: fire a small,
+non-destructive probe battery at a disposable local copy of BlueBird and
+see what the sink actually does. This is Stage 4.5 -- see `CLAUDE.md`'s
+"Dynamic Verification (Stage 4.5)" section for the exact scope boundary
+(four fixed metacharacter probes, local-only, never a real injection
+technique) and `README.md`'s "Stage 4.5: dynamic verification" for the full
+command reference.
+
+**1. Stand up the replica.** This automates the exact recompile-and-run
+process `tests/searching_for_strings_live_debug_writeup.md` walks through by
+hand:
+
+```bash
+.venv/bin/python -m pipeline.cli setup-target-env \
+    --source ~/BlueBirdSourceCode/BOOT-INF/classes \
+    --schema-sql ~/BlueBirdSourceCode/schema.sql \
+    --db-user bluebird --db-password bluebird --db-name bluebird \
+    --app-port 8090 --db-port 5440 \
+    --db data/recon.db
+```
+
+This prints `env_id=<N>`. Recompiling is idempotent (safe to re-run if the
+build already exists), and the app is started with explicit
+`--server.port`/`--spring.datasource.*` overrides so it definitely binds to
+*this* container and *this* port -- not whatever the decompiled source's
+own `application.properties` happens to default to.
+
+**2. Describe `signupPOST`'s request shape once**, in a
+`request-templates.json` Stage 4.5 will reuse for every parameter on this
+endpoint (Stage 0 has no route-path/sibling-parameter information to infer
+this from, so it's supplied, not guessed):
+
+```json
+{
+  "signupPOST": {
+    "endpoint": "/signup",
+    "http_method": "POST",
+    "param_defaults": {
+      "name": "Probe User",
+      "username": "probeuser_{nonce}",
+      "email": "probe_{nonce}@test.com",
+      "password": "ProbePass123",
+      "repeatPassword": "ProbePass123"
+    },
+    "verify_table": "users"
+  }
+}
+```
+
+**3. Fire the battery:**
+
+```bash
+.venv/bin/python -m pipeline.cli dynamic-probe \
+    --env-id 1 \
+    --request-templates request-templates.json \
+    --model whiterabbitneo-33b:latest \
+    --db data/recon.db
+```
+
+Against real BlueBird, this produces exactly what the manual live-debug
+session found -- plus more, because all four probes run automatically
+instead of just the one apostrophe test done by hand:
+
+```sql
+SELECT probe_name, http_status, classification, app_log_snippet
+FROM dynamic_probe_results WHERE batch_id = 1;
+```
+
+| `probe_name` | `http_status` | `classification` | what happened |
+|---|---|---|---|
+| `baseline` | 200 | `passthrough_unmodified` | signup succeeds, `name` stored as sent |
+| `single_quote` | 500 | `error` | real `BadSqlGrammarException` / `PSQLException: Unterminated string literal` in the app log -- the same crash `tests/searching_for_strings_live_debug_writeup.md` found by hand |
+| `double_quote` | 200 | `passthrough_unmodified` | `"` is not special to this sink |
+| `backslash` | 200 | `passthrough_unmodified` | `\` is not special to this sink either |
+
+That last row is a genuine finding beyond what the manual session checked
+-- it tells you specifically *which* character breaks the query, not just
+that *something* does.
+
+**4. Tear it down** once you're done (not automatic on a crash, so do this
+explicitly even after an interrupted run):
+
+```bash
+.venv/bin/python -m pipeline.cli teardown-target-env --env-id 1 --db data/recon.db
+```
+
+**This is what you hand to `sqlmap` next, not a finding on its own.**
+`dynamic_probe_results` is evidence for a human (or a separate,
+human-directed tool) to act on -- it never writes to `findings`, and Stage
+4.5's four probes deliberately stop well short of any real injection
+technique. If you were verifying `signupPOST`'s `password`/
+`repeatPassword` fields instead of `name`, note the classification would
+likely read `rejected` even though real rows *are* inserted with real
+BCrypt hashes -- a known limitation (see `ARCHITECTURE.md`'s "Known
+boundaries") where a one-way transform defeats the `LIKE '%nonce%'`
+verify-row lookup regardless of whether the value was actually accepted.
+Read a `rejected` result on a hashed/encoded field skeptically, not at face
+value.
+
 ### Verifying a finding with VS Code's debugger, and logging it
 
 Everything so far is a *hypothesis* -- a plain-English claim about what the
