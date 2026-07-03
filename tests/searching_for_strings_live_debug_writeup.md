@@ -317,13 +317,19 @@ if you try to run it directly. To live-debug it, you need to turn that
 decompiled source back into runnable bytecode first.
 
 ```bash
-cd ~/BlueBirdSourceCode
 mkdir -p ~/bluebird-build
 javac --release 17 -g -parameters \
   -d ~/bluebird-build \
-  -cp "BOOT-INF/lib/*" \
-  $(find BOOT-INF/classes -name "*.java")
+  -cp "$HOME/BlueBirdSourceCode/BOOT-INF/lib/*" \
+  $(find "$HOME/BlueBirdSourceCode/BOOT-INF/classes" -name "*.java")
 ```
+
+(This uses the full `$HOME/BlueBirdSourceCode/...` path everywhere on
+purpose, not a relative `BOOT-INF/classes` — that way this command gives
+the same result no matter which directory your terminal happens to be in
+when you run it. If you copy commands between terminal tabs a lot, this is
+the detail that most commonly bites people on this exact step: see the
+verification check right below before moving on.)
 
 What the flags mean, since each one matters here:
 - `--release 17` — compile *for* Java 17, matching the app's own
@@ -346,6 +352,27 @@ no errors. If you see real compile errors instead, they'll name the exact
 `javac` won't accept as-is; that's rare here and not expected for BlueBird's
 codebase.
 
+**Verify this step actually produced something before moving on — this is
+the single most common point of failure in this whole guide, and it fails
+silently.** If `find` can't locate `BOOT-INF/classes` (e.g. because this
+command was run from somewhere other than intended, before the fix above,
+or because `~/BlueBirdSourceCode` doesn't exist where expected), the
+`$(find ...)` part quietly expands to nothing, and `javac` runs with zero
+input files — which prints a one-line `error: no source files` that's easy
+to mistake for one of the two harmless notes above, and leaves
+`~/bluebird-build` completely empty with no other warning. Confirm the
+app's actual entry-point class is really there:
+
+```bash
+ls -la ~/bluebird-build/com/bmdyy/bluebird/BlueBirdApplication.class
+```
+
+If this reports `No such file or directory`: delete `~/bluebird-build`
+(`rm -rf ~/bluebird-build`) and re-run the `javac` command above exactly as
+written. Do not proceed to Step 5 until this `ls` succeeds — if it doesn't,
+Step 5 will fail with a `ClassNotFoundException` that gives no hint the
+real problem is back here.
+
 ## Step 5 — Start BlueBird with remote debugging enabled
 
 ```bash
@@ -367,6 +394,23 @@ Started BlueBirdApplication in ... seconds
 debugger attaches (that's `suspend=y`, which is what `tests/live-debugging.md`
 uses for the "attach before anything runs" case — either works here since
 we're only interested in one specific request later, not startup code).
+
+**If you see this instead of the startup banner:**
+```
+Error: Could not find or load main class com.bmdyy.bluebird.BlueBirdApplication
+Caused by: java.lang.ClassNotFoundException: com.bmdyy.bluebird.BlueBirdApplication
+```
+Step 4 didn't actually compile anything — this is the *only* thing that
+produces this specific error, since `$HOME/bluebird-build` is the one
+classpath entry that's supposed to contain this class. Go back to Step 4's
+verification `ls` command above; it will report the file missing, and
+redoing Step 4 (from a fresh, empty `~/bluebird-build`) fixes it.
+
+(A different, unrelated error —
+`java.lang.IllegalArgumentException: Unsupported class file major version`
+— means Step 4 compiled *something*, just for the wrong Java version;
+confirm you used `--release 17` exactly as written, not your system's
+default.)
 
 In a second terminal, confirm it's actually serving requests:
 

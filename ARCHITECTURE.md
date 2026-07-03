@@ -404,6 +404,57 @@ every method.
   large codebase this means re-running `triage` after a small source change
   currently costs the same as the first full run.
 
+## Future direction: a real code-graph backend (Joern or similar) under Stage 0/3
+
+Not a default next step -- like cross-file resolution above, this is a
+deliberate, measured decision to make only if a specific trigger below is
+actually hit for a real target, not something to build preemptively.
+
+**What this would replace**: Stage 0 (`pipeline/stage0_index/parser.py`/
+`indexer.py`) and Stage 3 (`pipeline/stage3_trace/builder.py`)'s current
+mechanics. Stage 3's graph walk today is a hand-rolled, same-file-only
+stand-in for real interprocedural dataflow -- a resolved-call-edge lookup
+plus a getter-name-matching regex, built specifically to work around the
+lack of a real dataflow engine underneath it (see `assemble_context()`).
+A Code Property Graph tool like Joern -- chosen over CodeQL specifically
+because it tolerates partial/decompiled/bytecode-derived source, where
+CodeQL generally wants a working build (often the actual blocker for a
+target you only have a decompiled jar for) -- would replace both of these
+with a real graph: resolved calls and dataflow/taint paths across file
+boundaries, computed algorithmically instead of approximated by regex.
+
+**What would NOT change**: Stage 1, 2, and 4 -- the LLM judgment layers.
+Their design (separate bounded calls, defensive JSON parsing, `llm_runs`
+provenance, "the LLM never decides what to look at next") stays exactly as
+it is; they'd just read chunk/context boundaries from whatever schema sits
+on top of the CPG instead of the current `symbols`/`call_edges` tables, and
+get to reason over genuinely complete cross-file context instead of the
+current same-file-only slice.
+
+**Concrete triggers that would justify doing this** (any one, not a
+schedule):
+- A target has a real service/DAO/repository layer, where the actual
+  concatenation happens inside a shared utility class several calls away
+  from the controller, and that utility method's own parameters carry no
+  Spring input annotations -- Stage 0's `input_sources` table would never
+  mark it as attacker-reachable at all, a true miss, not just an
+  incompletely-explained one.
+- Cross-file second-order chains become the common case rather than the
+  exception -- e.g. a target where the write site and the unsafe read site
+  for a stored value are routinely in different files, the way
+  `AuthController.signupPOST` (a second, real write path for `profile()`'s
+  `email`) already is for BlueBird, but which Stage 3's same-file heuristic
+  cannot follow (see `EXPECTED_FINDINGS.md`'s `/profile/{id}` writeup).
+- Scale or audit-grade repeatability starts mattering more than the current
+  tool's flexibility -- many/large codebases where LLM-per-method cost and
+  the demonstrated judgment errors (see "Known boundaries" above) start
+  costing more analyst re-checking time than they save.
+
+Until one of these is actually true for a real target, the current
+approach's practical advantages -- no build step required, and an LLM's
+flexible judgment that doesn't need a new query written per validation
+pattern -- outweigh a CPG's soundness and cross-file completeness.
+
 ## Extending this
 
 **Adding a new prompt version** (e.g. `triage_v2.txt`): add the new file to
@@ -411,17 +462,19 @@ every method.
 old prompt file in place (don't overwrite `triage_v1.txt`) so old
 `llm_runs` rows stay resolvable to the exact prompt that produced them.
 
-**Adding Stage 5 (human verification gate)**: this is the next unbuilt
-stage. Per `CLAUDE.md` it's a human-led review step, not an LLM or
-automation stage -- its job is to let a person mark `findings.verified_by_human`
-and `status` after inspecting a `trace_results` row (or a `triage_results`
-row directly, for findings without a trace) against the live target, e.g.
-via `tests/live-debugging.md`'s manual IDE-debugging technique, which is
-exactly what `findings.verification_method='live_debug'` already exists to
-record. Nothing about live debugging (or query-log inspection, or manual
-payload testing) belongs in pipeline code -- Stage 5 only needs a way to
-read candidate findings and write a human's verdict back, never to drive a
-debugger or fire requests itself.
+**Stage 5 (human verification gate)**: the write-side is built --
+`pipeline/stage5_verify/logger.py`'s `log_finding()`, wired to
+`pipeline.cli log-finding`. It's deliberately minimal: a human records a
+verdict they already reached -- via live debugging (`tests/live-debugging.md`,
+`tests/searching_for_strings_live_debug_writeup.md`), query-log inspection,
+or manual payload testing -- into `findings`, with `verification_method`/
+`status` validated against `schema.sql`'s `CHECK` constraints before
+anything is written. Nothing about live debugging or payload testing lives
+in pipeline code, and nothing here does that -- it only ever persists a
+decision a human already made. Still unbuilt: any workflow beyond this one
+write command (a review queue, browsing un-verified candidates one at a
+time) -- add that only if the raw `sqlite3`/CLI workflow in `WALKTHROUGH.md`'s
+verification section stops scaling, not preemptively.
 
 **Swapping the model**: no code changes needed -- `--model <tag>` on any CLI
 command. Re-run `bench/context_benchmark.py` against the new model first
