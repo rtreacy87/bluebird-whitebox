@@ -412,6 +412,21 @@ redoing Step 4 (from a fresh, empty `~/bluebird-build`) fixes it.
 confirm you used `--release 17` exactly as written, not your system's
 default.)
 
+**If instead you see:**
+```
+ERROR: transport error 202: bind failed: Address already in use
+ERROR: JDWP Transport dt_socket failed to initialize, TRANSPORT_INIT(510)
+```
+Something is already listening on port 8000 — almost always a BlueBird
+instance from an earlier attempt that never got stopped (closing the
+terminal window doesn't always kill it). Find and stop it, then re-run the
+command above:
+```bash
+ss -tlnp 2>/dev/null | grep 8000
+```
+This prints the PID holding the port (`users:(("java",pid=<PID>,...`) --
+stop it with `kill <PID>` and try Step 5 again.
+
 In a second terminal, confirm it's actually serving requests:
 
 ```bash
@@ -419,6 +434,254 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/signup
 ```
 
 You should see `200`.
+
+## No VS Code? Use `jdb` directly from a terminal instead
+
+Steps 6-8 below drive VS Code's Java debugger, but that's a GUI wrapped
+around a standard protocol (JDWP) — the same one `-Xrunjdwp` opened in
+Step 5. `jdb`, bundled with every JDK, speaks that protocol directly from
+a terminal, with no GUI, no extensions, and no `launch.json`. This covers
+exactly the same ground as Steps 6-8, interactively.
+
+**Prefer this path going forward, not just as a VS Code fallback.**
+Anything you do in a terminal — `jdb` commands, `curl` requests, `sqlmap`
+runs, whatever comes next — produces plain text you can capture to a file
+and log systematically. Something you saw in a GUI's Variables panel is
+much harder to turn into a reproducible record later; a terminal
+transcript can be `grep`'d, diffed, attached to a `log-finding` call
+verbatim, or handed to someone else to reproduce exactly. See "Recording a
+session systematically" at the end of this section for how to actually
+capture one.
+
+You'll want three terminals: one running BlueBird (Step 5), one for `jdb`,
+one for `curl`.
+
+### Managing BlueBird itself from the terminal
+
+You need exactly one BlueBird process running before any of this works,
+and exactly one listening on port 8000 — running two at once is the most
+common way this whole workflow breaks (it's what caused the two errors
+earlier in this session: a leftover process holding port 8000, and an
+attach attempt racing against the wrong instance).
+
+**Check if one's already running before starting another:**
+```bash
+ps aux | grep "[j]ava.*BlueBird"
+ss -tln 2>/dev/null | grep -E "8000|8080"
+```
+If both come back empty, nothing's running — proceed to start it. If a
+process shows up, decide whether to reuse it (skip straight to `jdb
+-attach`) or restart it fresh (next).
+
+**Start it** (this is Step 5's command, included here for reference):
+```bash
+cd ~/BlueBirdSourceCode
+java -Xdebug -Xrunjdwp:transport=dt_socket,address=8000,server=y,suspend=n \
+  -cp "$HOME/bluebird-build:BOOT-INF/classes:BOOT-INF/lib/*" \
+  com.bmdyy.bluebird.BlueBirdApplication
+```
+This blocks the terminal it's run in (by design — that terminal's output
+*is* BlueBird's live application log, which matters when you get to Step 8
+and need to see the actual `PSQLException` it prints). Leave it running
+there; do everything else in other terminals.
+
+**Stop it:**
+- If it's in the foreground of a terminal you have open: `Ctrl+C` in that
+  terminal.
+- If you lost track of which terminal, or it's backgrounded: find the PID
+  and kill it directly —
+  ```bash
+  ps aux | grep "[j]ava.*BlueBird"
+  kill <PID>
+  ```
+
+**Restart it cleanly** (stop, confirm the port is actually free, start
+again — don't skip the confirmation, since a process can take a moment to
+fully release the port after `kill`):
+```bash
+kill <PID>
+sleep 2
+ss -tln 2>/dev/null | grep -E "8000|8080"   # should print nothing
+cd ~/BlueBirdSourceCode
+java -Xdebug -Xrunjdwp:transport=dt_socket,address=8000,server=y,suspend=n \
+  -cp "$HOME/bluebird-build:BOOT-INF/classes:BOOT-INF/lib/*" \
+  com.bmdyy.bluebird.BlueBirdApplication
+```
+
+**On reattaching**: contrary to what this writeup said earlier, `jdb`
+disconnecting (via `exit`/`quit`) does *not* reliably break future
+attach attempts — reattaching to the same still-running BlueBird instance
+was tested and worked cleanly, twice in a row, while writing this section.
+If `jdb -attach` does fail, treat it as a plain connectivity question, not
+a "the JVM used up its one connection" problem: confirm something is
+actually listening (`ss -tln | grep 8000`), and only restart BlueBird if
+it isn't.
+
+### Attaching and setting breakpoints
+
+```bash
+jdb -attach localhost:8000
+```
+You should land at a `>` prompt. If you get
+`Failed to attach to remote debugger` or a connection-refused-style error,
+see the reattaching note just above — check `ss -tln | grep 8000` before
+assuming anything more complicated is wrong.
+
+Set a breakpoint at a specific line (this is the one Step 6 also points
+VS Code at):
+```
+stop at com.bmdyy.bluebird.controller.AuthController:171
+```
+`jdb` confirms with `Set breakpoint com.bmdyy.bluebird.controller.AuthController:171`.
+
+You can also break on method *entry* instead of a specific line, if you
+don't already know which line matters:
+```
+stop in com.bmdyy.bluebird.controller.AuthController.signupPOST
+```
+
+**Setting more than one breakpoint** works exactly the same way, one `stop
+at`/`stop in` per location — useful if you want to compare, say, the
+INSERT line (171) against the `BCrypt.hashpw` call the line above (170) as
+two separate stops:
+```
+stop at com.bmdyy.bluebird.controller.AuthController:170
+stop at com.bmdyy.bluebird.controller.AuthController:171
+```
+
+**List every breakpoint currently set** (either command works, they're
+equivalent for this):
+```
+stop
+```
+or
+```
+clear
+```
+
+**Remove one specific breakpoint** (note `clear` does double duty — no
+arguments lists breakpoints, as above; with a location, it removes one):
+```
+clear com.bmdyy.bluebird.controller.AuthController:170
+```
+
+### Triggering the breakpoint
+
+In the `curl` terminal:
+```bash
+curl -s -X POST http://localhost:8080/signup \
+  -d "name=Second Test User" \
+  -d "username=seconduser456" \
+  -d "email=second@example.com" \
+  -d "password=AnotherPass2" \
+  -d "repeatPassword=AnotherPass2"
+```
+This hangs with no response — that's correct, it means the breakpoint
+caught the request. Back in the `jdb` terminal you should see:
+```
+Breakpoint hit: "thread=http-nio-8080-exec-1", com.bmdyy.bluebird.controller.AuthController.signupPOST(), line=171 bci=169
+```
+
+### Once stopped: inspecting, stepping, and resuming
+
+**Inspect everything in scope** — the terminal equivalent of VS Code's
+Variables panel:
+```
+locals
+```
+This prints `name`, `username`, `email`, `password`, `repeatPassword`, and
+`passwordHash` with their real, current values.
+
+**Inspect one specific value** instead of everything:
+```
+print passwordHash
+```
+
+**See the call stack** you're currently stopped in:
+```
+where
+```
+
+**See the source around where you're stopped:**
+```
+list
+```
+
+**Step through line by line** rather than jumping straight to the next
+breakpoint:
+- `next` — execute the current line, stepping *over* any method calls it
+  makes (stay in `signupPOST`, don't follow into `BCrypt.hashpw`).
+- `step` — execute the current line, stepping *into* the first method call
+  it makes, if any (follow execution into `BCrypt.hashpw` itself).
+- `step up` — run until the current method returns to whatever called it.
+
+**Resume normally** once you've looked at what you came for:
+```
+cont
+```
+This continues until the next breakpoint hit (if any are still enabled) or
+the program finishes. The hung `curl` request completes.
+
+### Proving the injection (Step 8's apostrophe test)
+
+Repeat the trigger step above with the apostrophe-bearing request instead:
+```bash
+curl -s -X POST http://localhost:8080/signup \
+  --data-urlencode "name=O'Reilly Tester" \
+  -d "username=thirduser789" \
+  -d "email=third@example.com" \
+  -d "password=YetAnotherPw3" \
+  -d "repeatPassword=YetAnotherPw3"
+```
+At the breakpoint, `locals` will show `name = "O'Reilly Tester"` —
+unescaped. Run `cont`, then check the terminal running BlueBird itself
+(not `jdb`) for the `BadSqlGrammarException`/`PSQLException` — that error
+comes from the app/database, not the debugger, so it prints wherever
+BlueBird's own console output goes regardless of which debugger got you
+there.
+
+### Exiting jdb
+
+```
+exit
+```
+(`quit` is an identical alias.) This detaches `jdb` only — BlueBird itself
+keeps running, untouched, exactly as confirmed under "On reattaching"
+above. To stop BlueBird too, go back to "Managing BlueBird itself from the
+terminal" and stop/restart it there — `jdb` exiting is not the same action
+as BlueBird stopping.
+
+### Recording a session systematically
+
+To turn everything above into a reviewable, loggable artifact instead of
+something you watched happen once: wrap the whole session in `script(1)`,
+which records every byte your terminal shows to a file, timestamps
+included if you want them:
+
+```bash
+script -t 2> ~/bluebird-jdb-timing.log ~/bluebird-jdb-session.log
+# ... run jdb, curl, everything above, normally, inside this recorded shell ...
+exit   # exits the recording (a *second* `exit`, on top of jdb's own) -- not a typo
+```
+
+`~/bluebird-jdb-session.log` now has the literal transcript: the breakpoint
+hits, every `locals` dump, the real `passwordHash` value, and the real
+`PSQLException` text, exactly as they appeared. That's what turns into
+`pipeline.cli log-finding`'s `--notes` — either paste the relevant lines
+directly, or point at the file:
+```bash
+.venv/bin/python -m pipeline.cli log-finding \
+    --db data/recon.db \
+    --endpoint /signup \
+    --vuln-class sql_injection \
+    --verification-method live_debug \
+    --status confirmed \
+    --notes "$(sed -n '/Breakpoint hit/,/PSQLException/p' ~/bluebird-jdb-session.log)" \
+    --source-trace-id 4
+```
+This is exactly the point of doing dynamic testing from a terminal instead
+of a GUI: the evidence and the log entry can be the same text, not a
+paraphrase of what you remember seeing.
 
 ## Step 6 — Open the project in VS Code and set up remote debugging
 
@@ -507,6 +770,10 @@ row with `name`/`username`/`email` stored exactly as submitted and
 `password` stored as the BCrypt hash:
 
 ```bash
+# Option A (container, from Step 3):
+podman exec bluebird-pg psql -U bbuser -d bluebird -c "SELECT id, name, username, email, password FROM users;"
+
+# Option B (local install, from Step 3):
 sudo -u postgres psql -d bluebird -c "SELECT id, name, username, email, password FROM users;"
 ```
 
