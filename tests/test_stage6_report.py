@@ -38,12 +38,13 @@ def empty_conn(tmp_path):
 
 
 def test_assemble_finding_records_real_signup_finding(real_conn):
-    # data/recon.db currently has three real, human-verified findings:
+    # data/recon.db currently has four real, human-verified findings:
     # finding_id=1 (/signup, live_debug), finding_id=2 (/find-user,
-    # manual_payload -- tests/common_character_bypass_writeup.md), and
-    # finding_id=3 (/forgot, manual_payload -- tests/error_based_sqli_writeup.md).
+    # manual_payload -- tests/common_character_bypass_writeup.md),
+    # finding_id=3 (/forgot, manual_payload -- tests/error_based_sqli_writeup.md),
+    # and finding_id=4 (/profile/{id}, manual_payload -- tests/second_order_sqli_writeup.md).
     records = assemble_finding_records(real_conn)
-    assert len(records) == 3
+    assert len(records) == 4
     record = next(r for r in records if r["endpoint"] == "/signup")
     assert record["vuln_class"] == "sql_injection"
     assert record["triage"]["symbol_name_raw"] == "signupPOST"
@@ -64,9 +65,9 @@ def test_only_confirmed_verified_findings_are_included(real_conn):
     )
     real_conn.commit()
     records = assemble_finding_records(real_conn)
-    # The three seeded real findings (/signup, /find-user, /forgot) -- the
-    # needs_review and unverified-confirmed rows just inserted must not appear.
-    assert {r["endpoint"] for r in records} == {"/signup", "/find-user", "/forgot"}
+    # The four seeded real findings (/signup, /find-user, /forgot, /profile/{id}) --
+    # the needs_review and unverified-confirmed rows just inserted must not appear.
+    assert {r["endpoint"] for r in records} == {"/signup", "/find-user", "/forgot", "/profile/{id}"}
 
 
 # ---------- dbms_hints ----------
@@ -228,10 +229,10 @@ def test_export_report_writes_file_and_provenance_row(real_conn, tmp_path):
     out_path = tmp_path / "report.md"
     export_id, finding_count = export_report(real_conn, "markdown", str(out_path))
     assert out_path.exists()
-    assert finding_count == 3
+    assert finding_count == 4
     row = real_conn.execute("SELECT * FROM report_exports WHERE export_id = ?", (export_id,)).fetchone()
     assert row["format"] == "markdown"
-    assert row["finding_count"] == 3
+    assert row["finding_count"] == 4
 
 
 def test_export_report_sqlmap_json_is_valid_json(real_conn, tmp_path):
@@ -240,9 +241,9 @@ def test_export_report_sqlmap_json_is_valid_json(real_conn, tmp_path):
     payload = json.loads(out_path.read_text())
     assert payload["schema_version"] == "sqlmap_candidate_v1"
     # 3 reactive signupPOST candidates (name/username/email) + 1 null-fallback
-    # candidate for /find-user + 1 null-fallback candidate for /forgot
+    # candidate each for /find-user, /forgot, and /profile/{id}
     # (see test_sqlmap_json_filters_to_reactive_params_only).
-    assert len(payload["candidates"]) == 5
+    assert len(payload["candidates"]) == 6
 
 
 def test_export_report_bad_format_raises(real_conn, tmp_path):
