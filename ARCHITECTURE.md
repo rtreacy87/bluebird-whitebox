@@ -713,6 +713,40 @@ every method.
   outcome), the container and app process from `setup-target-env` are left
   running until `teardown-target-env` is run explicitly -- there is no
   crash-handler or timeout that tears them down on the pipeline's behalf.
+- **Stage 4.5 cannot dynamically verify an authenticated endpoint, and
+  running it against one anyway doesn't fail loudly -- it produces a
+  confidently wrong result.** `probes.fire_probe()`/`request-templates.json`
+  have no cookie/session/header support at all. Discovered directly while
+  running `findUser`'s `/find-user?u=` through Stage 4.5
+  (`tests/common_character_bypass_writeup.md`): the endpoint sits behind
+  Spring Security, so every probe request gets redirected to `/login`
+  before ever reaching the vulnerable code, and `requests.get()` follows
+  that redirect by default. `classify_probe()` sees a clean `200` (the
+  login page) with no DB row and no error marker, and confidently labels
+  every one of the four probes `rejected` -- identical to what a
+  genuinely-validated-away value would produce. There is nothing in the
+  recorded row that distinguishes "the filter blocked this" from "this
+  request never got near the filter." Adding cookie/header support to
+  `request-templates.json` and `fire_probe()`/`run_battery()` is a
+  concrete, scoped, not-yet-done next step.
+- **Even on an authenticated request, a value that provably breaks the
+  query can still classify `rejected`, if the endpoint catches its own SQL
+  exception and logs only the bare message.** Also found via `findUser`
+  (`tests/common_character_bypass_writeup.md`), by replaying the exact
+  probe values with a real auth cookie attached by hand and feeding the
+  real captured evidence into the real `classify_probe()`: `findUser`
+  catches `BadSqlGrammarException` itself and returns a normal `200` "error"
+  view (never a `5xx`), and its catch block only prints
+  `e.getSQLException().getMessage()` -- the bare PostgreSQL message text,
+  with no exception class name. None of `classify.py`'s `_ERROR_MARKERS`
+  (`BadSqlGrammarException`/`PSQLException`/`SQLException`/`Exception`)
+  appear in that text, so even the log-based fallback signal that worked
+  for `signupPOST`'s *uncaught* exception (a full class-qualified stack
+  trace) is silently absent here. This is sharper than the already-documented
+  BCrypt/one-way-transform gap above: that one produces an honestly
+  uncertain-looking `rejected`; this one produces a `rejected` that looks
+  exactly as confident as a correct one, for a value that demonstrably
+  reached and broke the sink.
 - **A real `CHECK` constraint bug was found and fixed while building
   Stage 6.** `findings.verification_method`'s original `CHECK` included a
   bare `NULL` literal inside an `IN (...)` list -- a pattern that silently
