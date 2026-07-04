@@ -38,10 +38,12 @@ def empty_conn(tmp_path):
 
 
 def test_assemble_finding_records_real_signup_finding(real_conn):
+    # data/recon.db currently has two real, human-verified findings:
+    # finding_id=1 (/signup, live_debug) and finding_id=2 (/find-user,
+    # manual_payload -- see tests/common_character_bypass_writeup.md).
     records = assemble_finding_records(real_conn)
-    assert len(records) == 1
-    record = records[0]
-    assert record["endpoint"] == "/signup"
+    assert len(records) == 2
+    record = next(r for r in records if r["endpoint"] == "/signup")
     assert record["vuln_class"] == "sql_injection"
     assert record["triage"]["symbol_name_raw"] == "signupPOST"
     assert record["trace"]["verdict"] == "exploitable_path"
@@ -61,8 +63,9 @@ def test_only_confirmed_verified_findings_are_included(real_conn):
     )
     real_conn.commit()
     records = assemble_finding_records(real_conn)
-    assert len(records) == 1
-    assert records[0]["endpoint"] == "/signup"
+    # The two seeded real findings (/signup, /find-user) -- the needs_review
+    # and unverified-confirmed rows just inserted must not appear.
+    assert {r["endpoint"] for r in records} == {"/signup", "/find-user"}
 
 
 # ---------- dbms_hints ----------
@@ -88,12 +91,22 @@ def test_sqlmap_json_filters_to_reactive_params_only(real_conn):
     records = assemble_finding_records(real_conn)
     payload = render_sqlmap_json(records, "2026-01-01T00:00:00+00:00")
     assert payload["schema_version"] == "sqlmap_candidate_v1"
-    param_names = {c["target_param_name"] for c in payload["candidates"]}
+
+    signup_candidates = [c for c in payload["candidates"] if c["finding_id"] == 1]
+    param_names = {c["target_param_name"] for c in signup_candidates}
     assert param_names == {"name", "username", "email"}
-    for candidate in payload["candidates"]:
+    for candidate in signup_candidates:
         assert candidate["dbms_hint"] == "postgresql"
         assert candidate["note"] is None
         assert "single_quote" in candidate["evidence"]["probe_classifications"]
+
+    # finding_id=2 (/find-user) has only uniformly-`rejected` Stage 4.5
+    # evidence (an auth-gap artifact, see common_character_bypass_writeup.md)
+    # -- Stage 6 must not fabricate a target_param_name/dbms_hint for it.
+    find_user_candidates = [c for c in payload["candidates"] if c["finding_id"] == 2]
+    assert len(find_user_candidates) == 1
+    assert find_user_candidates[0]["target_param_name"] is None
+    assert find_user_candidates[0]["note"] is not None
 
 
 def test_sqlmap_json_includes_param_defaults_when_request_templates_given(real_conn):
@@ -106,8 +119,17 @@ def test_sqlmap_json_includes_param_defaults_when_request_templates_given(real_c
     }
     records = assemble_finding_records(real_conn)
     payload = render_sqlmap_json(records, "2026-01-01T00:00:00+00:00", request_templates=request_templates)
-    for candidate in payload["candidates"]:
+    signup_candidates = [c for c in payload["candidates"] if c["finding_id"] == 1]
+    assert signup_candidates
+    for candidate in signup_candidates:
         assert candidate["param_defaults"] == {"name": "Probe User", "username": "probeuser_{nonce}"}
+
+    # /find-user's triaged method is 'findUser', not in request_templates above --
+    # its candidate must not silently inherit signupPOST's param_defaults.
+    find_user_candidates = [c for c in payload["candidates"] if c["finding_id"] == 2]
+    assert find_user_candidates
+    for candidate in find_user_candidates:
+        assert candidate["param_defaults"] is None
 
 
 def test_sqlmap_json_param_defaults_null_without_request_templates(real_conn):
@@ -205,10 +227,10 @@ def test_export_report_writes_file_and_provenance_row(real_conn, tmp_path):
     out_path = tmp_path / "report.md"
     export_id, finding_count = export_report(real_conn, "markdown", str(out_path))
     assert out_path.exists()
-    assert finding_count == 1
+    assert finding_count == 2
     row = real_conn.execute("SELECT * FROM report_exports WHERE export_id = ?", (export_id,)).fetchone()
     assert row["format"] == "markdown"
-    assert row["finding_count"] == 1
+    assert row["finding_count"] == 2
 
 
 def test_export_report_sqlmap_json_is_valid_json(real_conn, tmp_path):
@@ -216,7 +238,9 @@ def test_export_report_sqlmap_json_is_valid_json(real_conn, tmp_path):
     export_report(real_conn, "sqlmap-json", str(out_path))
     payload = json.loads(out_path.read_text())
     assert payload["schema_version"] == "sqlmap_candidate_v1"
-    assert len(payload["candidates"]) == 3
+    # 3 reactive signupPOST candidates (name/username/email) + 1 null-fallback
+    # candidate for /find-user (see test_sqlmap_json_filters_to_reactive_params_only).
+    assert len(payload["candidates"]) == 4
 
 
 def test_export_report_bad_format_raises(real_conn, tmp_path):
