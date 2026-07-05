@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sqlmap_wrapper import db, guard, runner, targets
+from sqlmap_wrapper import cli, db, guard, runner, targets
 from sqlmap_wrapper.flags import DangerousFlagError, MissingRequestBodyError, build_args, check_extra_args
 from sqlmap_wrapper.import_candidates import InvalidCandidateExportError, import_candidates, validate_candidate, validate_export
 
@@ -86,6 +86,53 @@ def test_register_target_duplicate_rejected(conn):
     targets.register_target(conn, "10.10.11.5", 80)
     with pytest.raises(targets.TargetAlreadyRegisteredError):
         targets.register_target(conn, "10.10.11.5", 80)
+
+
+# ---------- CLI-level regression tests (real bugs found while using the CLI directly) ----------
+
+
+def test_cli_register_target_duplicate_shows_clean_error_not_traceback(tmp_path, capsys):
+    wrapper_db = str(tmp_path / "wrapper.db")
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["register-target", "--host", "10.10.11.5", "--port", "80", "--wrapper-db", wrapper_db])
+    cli.cmd_register_target(args)
+
+    args = parser.parse_args(["register-target", "--host", "10.10.11.5", "--port", "80", "--wrapper-db", wrapper_db])
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_register_target(args)
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "already registered as target_id=1" in captured.err
+
+
+def test_cli_update_authorization_changes_flag(tmp_path):
+    wrapper_db = str(tmp_path / "wrapper.db")
+    parser = cli.build_parser()
+
+    cli.cmd_register_target(parser.parse_args(
+        ["register-target", "--host", "10.10.11.5", "--port", "80", "--wrapper-db", wrapper_db]
+    ))
+    cli.cmd_update_authorization(parser.parse_args(
+        ["update-authorization", "--host", "10.10.11.5", "--port", "80", "--authorized", "1", "--wrapper-db", wrapper_db]
+    ))
+
+    conn = db.connect(wrapper_db)
+    row = targets.lookup_target(conn, "10.10.11.5", 80)
+    assert row["authorized"] == 1
+
+
+def test_cli_update_authorization_unregistered_host_fails_cleanly(tmp_path, capsys):
+    wrapper_db = str(tmp_path / "wrapper.db")
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        ["update-authorization", "--host", "1.2.3.4", "--port", "80", "--authorized", "1", "--wrapper-db", wrapper_db]
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_update_authorization(args)
+    assert exc_info.value.code == 1
+    assert "not registered" in capsys.readouterr().err
 
 
 def test_update_authorization(conn):

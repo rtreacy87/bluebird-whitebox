@@ -38,13 +38,15 @@ def empty_conn(tmp_path):
 
 
 def test_assemble_finding_records_real_signup_finding(real_conn):
-    # data/recon.db currently has four real, human-verified findings:
+    # data/recon.db currently has five real, human-verified findings:
     # finding_id=1 (/signup, live_debug), finding_id=2 (/find-user,
     # manual_payload -- tests/common_character_bypass_writeup.md),
     # finding_id=3 (/forgot, manual_payload -- tests/error_based_sqli_writeup.md),
-    # and finding_id=4 (/profile/{id}, manual_payload -- tests/second_order_sqli_writeup.md).
+    # finding_id=4 (/profile/{id}, manual_payload -- tests/second_order_sqli_writeup.md),
+    # and finding_id=5 (/signup, manual_payload, stacked-queries file write --
+    # tests/reading_writing_files_writeup.md).
     records = assemble_finding_records(real_conn)
-    assert len(records) == 4
+    assert len(records) == 5
     record = next(r for r in records if r["endpoint"] == "/signup")
     assert record["vuln_class"] == "sql_injection"
     assert record["triage"]["symbol_name_raw"] == "signupPOST"
@@ -229,10 +231,10 @@ def test_export_report_writes_file_and_provenance_row(real_conn, tmp_path):
     out_path = tmp_path / "report.md"
     export_id, finding_count = export_report(real_conn, "markdown", str(out_path))
     assert out_path.exists()
-    assert finding_count == 4
+    assert finding_count == 5
     row = real_conn.execute("SELECT * FROM report_exports WHERE export_id = ?", (export_id,)).fetchone()
     assert row["format"] == "markdown"
-    assert row["finding_count"] == 4
+    assert row["finding_count"] == 5
 
 
 def test_export_report_sqlmap_json_is_valid_json(real_conn, tmp_path):
@@ -240,10 +242,11 @@ def test_export_report_sqlmap_json_is_valid_json(real_conn, tmp_path):
     export_report(real_conn, "sqlmap-json", str(out_path))
     payload = json.loads(out_path.read_text())
     assert payload["schema_version"] == "sqlmap_candidate_v1"
-    # 3 reactive signupPOST candidates (name/username/email) + 1 null-fallback
-    # candidate each for /find-user, /forgot, and /profile/{id}
+    # 3 reactive signupPOST candidates (name/username/email) x 2 findings that
+    # both reference source_trace_id=4 (finding_id=1 and finding_id=5) + 1
+    # null-fallback candidate each for /find-user, /forgot, and /profile/{id}
     # (see test_sqlmap_json_filters_to_reactive_params_only).
-    assert len(payload["candidates"]) == 6
+    assert len(payload["candidates"]) == 9
 
 
 def test_export_report_bad_format_raises(real_conn, tmp_path):

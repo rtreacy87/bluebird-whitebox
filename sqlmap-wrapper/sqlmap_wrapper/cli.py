@@ -3,6 +3,7 @@
 Usage (run from the bluebird-whitebox repo root so `pipeline.*` stays
 importable -- see llm_runner.py's module docstring):
     python -m sqlmap_wrapper.cli register-target --host <H> --port <P> [--label L] [--authorize] --wrapper-db <path>
+    python -m sqlmap_wrapper.cli update-authorization --host <H> --port <P> --authorized 0|1 --wrapper-db <path>
     python -m sqlmap_wrapper.cli import-candidates --file <stage6-export.json> --wrapper-db <path>
     python -m sqlmap_wrapper.cli assign-target --candidate-id <N> --target-id <N> --wrapper-db <path>
     python -m sqlmap_wrapper.cli run-sqlmap --candidate-id <N> --output-dir <dir> [--execute] [--extra-args ...] --wrapper-db <path>
@@ -22,14 +23,34 @@ from sqlmap_wrapper.flags import DangerousFlagError, MissingRequestBodyError
 from sqlmap_wrapper.import_candidates import InvalidCandidateExportError, import_candidates
 from sqlmap_wrapper.interpret import interpret_run
 from sqlmap_wrapper.llm_runner import WrapperLLMRunner
+from sqlmap_wrapper.targets import TargetAlreadyRegisteredError
 
 DEFAULT_MODEL = "whiterabbitneo-33b:latest"
 
 
 def cmd_register_target(args):
     conn = db.connect(args.wrapper_db)
-    target_id = targets.register_target(conn, args.host, args.port, label=args.label, authorized=args.authorize)
+    try:
+        target_id = targets.register_target(conn, args.host, args.port, label=args.label, authorized=args.authorize)
+    except TargetAlreadyRegisteredError:
+        existing = targets.lookup_target(conn, args.host, args.port)
+        print(
+            f"error: {args.host}:{args.port} is already registered as target_id={existing['target_id']} "
+            f"(authorized={bool(existing['authorized'])}) -- reuse that target_id, or run "
+            f"update-authorization to change it",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print(f"target_id={target_id} authorized={args.authorize}")
+
+
+def cmd_update_authorization(args):
+    conn = db.connect(args.wrapper_db)
+    rowcount = targets.update_authorization(conn, args.host, args.port, bool(args.authorized))
+    if rowcount == 0:
+        print(f"error: {args.host}:{args.port} is not registered -- run register-target first", file=sys.stderr)
+        sys.exit(1)
+    print(f"{args.host}:{args.port} authorized={bool(args.authorized)}")
 
 
 def cmd_import_candidates(args):
@@ -97,6 +118,15 @@ def build_parser():
     p_register.add_argument("--authorize", action="store_true", help="mark authorized=1 immediately")
     p_register.add_argument("--wrapper-db", default="sqlmap-wrapper/data/wrapper.db")
     p_register.set_defaults(func=cmd_register_target)
+
+    p_update_auth = sub.add_parser("update-authorization", help="change an already-registered target's authorized flag")
+    p_update_auth.add_argument("--host", required=True)
+    p_update_auth.add_argument("--port", type=int, required=True)
+    p_update_auth.add_argument(
+        "--authorized", type=int, choices=[0, 1], required=True, help="1 to authorize, 0 to revoke"
+    )
+    p_update_auth.add_argument("--wrapper-db", default="sqlmap-wrapper/data/wrapper.db")
+    p_update_auth.set_defaults(func=cmd_update_authorization)
 
     p_import = sub.add_parser("import-candidates", help="import a bluebird-whitebox Stage 6 sqlmap-candidate export")
     p_import.add_argument("--file", required=True, help="path to the Stage 6 JSON export")
